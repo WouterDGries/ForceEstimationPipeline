@@ -10,8 +10,8 @@ camera:
   # Color and depth may use different native profiles; frames are aligned to
   # the color image before processing.
   color:
-    width: 1920
-    height: 1080
+    width: 848
+    height: 480
     framerate: 30
     auto_exposure: false          # if false, exposure/gain below are used
     exposure: 156                 # microseconds, range 1-10000 (default 166)
@@ -21,8 +21,8 @@ camera:
     brightness: 0                 # range -64 to 64 (default 0)
     contrast: 50                  # range 0 to 100 (default 50)
   depth:
-    width: 1280
-    height: 720
+    width: 848
+    height: 480
     framerate: 30
     depth_units_m: 0.0001         # meters per depth count (0.1 mm steps)
     emitter_enabled: true
@@ -35,12 +35,12 @@ hand_tracking:
   model_path: ../hand_landmarker.task
   tracked_hand_label: Left        # which hand to follow: "Left" or "Right"
   fingertip_landmark_index: 8     # MediaPipe index-fingertip landmark
-  crop_size: 224                  # pixels; both color and depth crops are crop_size x crop_size
+  crop_size: 112                  # pixels; both color and depth crops are crop_size x crop_size
   depth_validation_tolerance_m: 0.02  # maximum center-to-neighborhood depth difference
   depth_validation_radius_m: 0.015     # radius of the 8-point validation ring around the fingertip
   minimum_valid_depth_samples: 5       # minimum passing points required out of 8
-  show_tracked_crop: true         # live preview window of the color crop
-  show_depth_preview: true        # live preview window of the (colorized) depth crop
+  show_tracked_crop: false         # live preview window of the color crop
+  show_depth_preview: false        # live preview window of the (colorized) depth crop
 
 force_sensor:
   # Only Fz (downward force) is used; Fx/Fy/Tx/Ty/Tz are discarded on arrival.

@@ -94,8 +94,8 @@ def main():
                                               color_crop_rgb, depth_crop)
                     frame_index += 1
                     recorded_frame_times_ns.append(host_ts_ns)  #Tracking live recording FPS
+                    force_histogram.add_samples(fz for _, fz in force_samples)  #Tracking force-range coverage
                 session_writer.add_force_samples(force_samples)  #Saving force samples
-                force_histogram.add_samples(fz for _, fz in force_samples)  #Tracking force-range coverage
 
             if len(recorded_frame_times_ns) >= 2:
                 span_s = (recorded_frame_times_ns[-1] - recorded_frame_times_ns[0]) / 1e9

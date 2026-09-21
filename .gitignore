@@ -1,0 +1,12 @@
+# Recorded RGB-D and force data
+/dataAcquisition/DataCollection/Data/*
+
+# Python cache and local tooling files
+__pycache__/
+*.py[cod]
+.vscode/
+
+# Local environment files
+.env
+.venv/
+venv/

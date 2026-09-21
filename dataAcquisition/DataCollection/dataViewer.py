@@ -35,6 +35,8 @@ DEFAULT_DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Da
 # On-screen panel size in pixels. Crops are scaled UP or DOWN to fit this, whatever
 # their native resolution (112, 224, ...) - never hardcode the crop size here.
 DISPLAY_SIZE_PX = 340
+DEPTH_REFERENCE_FRAME_INDEX = 1127
+DEPTH_RANGE_MARGIN_M = 0.02
 
 
 class SessionData:
@@ -51,6 +53,14 @@ class SessionData:
         self.color = self.h5["color"]
         self.depth = self.h5["depth"]
         self.depth_scale_m = self.meta["camera"]["depth"]["depth_scale_m"]
+        reference_depth = self.depth[DEPTH_REFERENCE_FRAME_INDEX]
+        valid_reference_depth = reference_depth[reference_depth > 0] * self.depth_scale_m
+        if valid_reference_depth.size == 0:
+            raise ValueError(f"Reference frame {DEPTH_REFERENCE_FRAME_INDEX} has no valid depth pixels")
+        self.depth_limits_m = (
+            float(valid_reference_depth.min() - DEPTH_RANGE_MARGIN_M),
+            float(valid_reference_depth.max() + DEPTH_RANGE_MARGIN_M),
+        )
 
         t0 = min(self.frames["host_ts_ns"].min(), self.force["host_ts_ns"].min())
         self.t0 = int(t0)
@@ -91,13 +101,13 @@ def numpy_rgb_to_pixmap(rgb_array, display_size):
     return pixmap.scaled(display_size, display_size, Qt.KeepAspectRatio, Qt.FastTransformation)
 
 
-def depth_crop_to_pixmap(depth_u16, display_size):
-    valid = depth_u16[depth_u16 > 0]
-    if valid.size == 0:
+def depth_crop_to_pixmap(depth_u16, display_size, depth_scale_m, depth_limits_m):
+    low_m, high_m = depth_limits_m
+    if not np.any(depth_u16 > 0):
         normalized = np.zeros_like(depth_u16, dtype=np.uint8)
     else:
-        low, high = np.percentile(valid, 1), np.percentile(valid, 99)
-        normalized = np.clip((depth_u16.astype(np.float32) - low) / max(high - low, 1e-6), 0, 1)
+        depth_m = depth_u16.astype(np.float32) * depth_scale_m
+        normalized = np.clip((depth_m - low_m) / max(high_m - low_m, 1e-6), 0, 1)
         normalized = (normalized * 255).astype(np.uint8)
         normalized[depth_u16 == 0] = 0
     colorized_bgr = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
@@ -193,7 +203,9 @@ class ViewerWindow(QMainWindow):
         color_crop = session.color[frame_index]
         depth_crop = session.depth[frame_index]
         self.color_panel.set_pixmap(numpy_rgb_to_pixmap(color_crop, DISPLAY_SIZE_PX))
-        self.depth_panel.set_pixmap(depth_crop_to_pixmap(depth_crop, DISPLAY_SIZE_PX))
+        self.depth_panel.set_pixmap(depth_crop_to_pixmap(
+            depth_crop, DISPLAY_SIZE_PX, session.depth_scale_m, session.depth_limits_m
+        ))
 
         detected = "yes" if row["fingertip_detected"] else "no"
         depth_valid = "yes" if row["fingertip_depth_valid"] else "no"
