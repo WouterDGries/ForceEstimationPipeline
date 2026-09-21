@@ -1,0 +1,55 @@
+# Configuration for the RGB-D + force-torque data-collection recorder.
+# Loaded by mainAcquisition.py and passed into cameraHandler / forceHandler /
+# dataWriter functions - nothing else in dataAcquisition/ hardcodes settings.
+
+camera:
+  # Valid (width, height) options for the D435 color stream (bgr8): 320x180,
+  # 320x240, 424x240, 640x360, 640x480, 848x480, 960x540, 1280x720, 1920x1080.
+  # Supported fps per resolution: 6/15/30/60 for anything up to 960x540,
+  # 6/15/30 only for 1280x720 and 1920x1080.
+  # Color and depth may use different native profiles; frames are aligned to
+  # the color image before processing.
+  color:
+    width: 1920
+    height: 1080
+    framerate: 30
+    auto_exposure: false          # if false, exposure/gain below are used
+    exposure: 156                 # microseconds, range 1-10000 (default 166)
+    gain: 64                      # range 0-128 (default 64)
+    auto_white_balance: false
+    white_balance: 3000           # Kelvin, range 2800-6500 in steps of 10 (default 4600)
+    brightness: 0                 # range -64 to 64 (default 0)
+    contrast: 50                  # range 0 to 100 (default 50)
+  depth:
+    width: 1280
+    height: 720
+    framerate: 30
+    depth_units_m: 0.0001         # meters per depth count (0.1 mm steps)
+    emitter_enabled: true
+    laser_power: 150              # range 0-360 in steps of 30 (default 150)
+    visual_preset: high_accuracy  # "default" or "high_accuracy" (rs.rs400_visual_preset)
+    # Depth is recorded raw: no on-device decimation/spatial/temporal/hole-filling
+    # filters are applied here.
+
+hand_tracking:
+  model_path: ../hand_landmarker.task
+  tracked_hand_label: Left        # which hand to follow: "Left" or "Right"
+  fingertip_landmark_index: 8     # MediaPipe index-fingertip landmark
+  crop_size: 224                  # pixels; both color and depth crops are crop_size x crop_size
+  depth_validation_tolerance_m: 0.02  # maximum center-to-neighborhood depth difference
+  depth_validation_radius_m: 0.015     # radius of the 8-point validation ring around the fingertip
+  minimum_valid_depth_samples: 5       # minimum passing points required out of 8
+  show_tracked_crop: true         # live preview window of the color crop
+  show_depth_preview: true        # live preview window of the (colorized) depth crop
+
+force_sensor:
+  # Only Fz (downward force) is used; Fx/Fy/Tx/Ty/Tz are discarded on arrival.
+  ip: 192.168.1.1
+  port: 49152
+  counts_per_newton: 1000000.0
+  calibration_interval_s: 3.0
+  send_keepalive: false
+  keepalive_interval_s: 15.0
+
+output:
+  root: DataCollection/Data
