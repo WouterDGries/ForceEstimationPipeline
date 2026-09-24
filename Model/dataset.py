@@ -168,7 +168,7 @@ def _build_window_index(sessions, window_config, stride, offset, split_name):
          spans a tracking-failure/dropped-frame gap, since a dropped frame
          inflates the elapsed time for the same frame-index span (frames.csv
          only ever contains frames where tracking succeeded - see
-         dataAcquisition/mainAcquisition.py's frame_is_valid gate - so a
+         dataAcquisition/offlineExtract.py's save_only_valid_frames gate - so a
          tracking failure shows up as a timestamp gap, not a flag);
       2. |Fz(last) - Fz(first)| <= max_force_change_n, from the filtered
          per-frame force.

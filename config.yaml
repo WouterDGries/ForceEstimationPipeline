@@ -3,21 +3,27 @@
 # dataWriter functions - nothing else in dataAcquisition/ hardcodes settings.
 
 camera:
-  # Valid (width, height) options for the D435 color stream (bgr8): 320x180,
+  # Valid (width, height) options for the D435 color stream: 320x180,
   # 320x240, 424x240, 640x360, 640x480, 848x480, 960x540, 1280x720, 1920x1080.
   # Supported fps per resolution: 6/15/30/60 for anything up to 960x540,
   # 6/15/30 only for 1280x720 and 1920x1080.
-  # Color and depth may use different native profiles; frames are aligned to
-  # the color image before processing.
+  # Color is captured as the camera's raw YUYV and depth unaligned; both are
+  # written to Raw/ while recording and aligned/cropped offline
+  # (offlineExtract.py), so a high color resolution no longer costs live fps.
+  # Under WSL the camera goes through usbipd (USB/IP), which carries only
+  # ~50 MB/s: measured 9.6 fps at 1920x1080, 18 fps at 1280x720, 29.6 fps at
+  # 960x540 (each + 848x480 depth). For 1920x1080 @ 30 fps run
+  # mainAcquisition.py natively on Windows (full USB3 bandwidth). The overlay
+  # shows "camera drops" in red when the resolution is too high for the link.
   color:
-    width: 1280
-    height: 720
+    width: 960
+    height: 540
     framerate: 30
     auto_exposure: false          # if false, exposure/gain below are used
-    exposure: 100                 # microseconds, range 1-10000 (default 166)
-    gain: 64                      # range 0-128 (default 64)
+    exposure: 100                 # D435 RGB: units of 100 us (100 = 10 ms), range 1-10000 (default 156) - verify in realsense-viewer
+    gain: 64                      # range 0-128 (default 64); prefer more light over more gain (gain = noise)
     auto_white_balance: false
-    white_balance: 3000           # Kelvin, range 2800-6500 in steps of 10 (default 4600)
+    white_balance: 3000           # Kelvin, range 2800-6500 in steps of 10 (default 4600); calibrate to the lamp with a grey card
     brightness: 0                 # range -64 to 64 (default 0)
     contrast: 50                  # range 0 to 100 (default 50)
   depth:
@@ -32,13 +38,21 @@ camera:
     # filters are applied here.
 
 hand_tracking:
-  model_path: ../hand_landmarker.task
-  tracked_hand_label: Left        # which hqand to follow: "Left" or "Right"
+  model_path: ../hand_landmarker.task   # relative to dataAcquisition/
+  tracked_hand_label: Left        # which hand to follow: "Left" or "Right"
   fingertip_landmark_index: 8     # MediaPipe index-fingertip landmark
-  crop_size: 112                  # pixels; both color and depth crops are crop_size x crop_size
   depth_validation_tolerance_m: 0.02  # maximum center-to-neighborhood depth difference
   depth_validation_radius_m: 0.015     # radius of the 8-point validation ring around the fingertip
   minimum_valid_depth_samples: 5       # minimum passing points required out of 8
+  # Crop geometry (applied offline; the live preview shows an approximation).
+  crop_output_px: 112             # both color and depth crops are crop_output_px x crop_output_px
+  crop_side_mm: 40.0              # physical side length covered at the fingertip depth (old 112px@848 was ~50mm)
+  anchor_dip_landmark_index: 7    # MediaPipe index DIP joint, defines the finger axis with the fingertip
+  anchor_alpha: 0.4               # crop center = TIP - anchor_alpha * (TIP - DIP): moves the nail/pad to the middle
+  rotate_to_finger_axis: false    # rotate crops so the finger always points up (reduces in-plane variation)
+  # Live preview only
+  live_preview_width: 640         # color frames are downscaled to this width for MediaPipe + display
+  live_mediapipe_every_n: 2       # submit every n-th frame to MediaPipe
   show_tracked_crop: false         # live preview window of the color crop
   show_depth_preview: false        # live preview window of the (colorized) depth crop
 
@@ -52,7 +66,22 @@ force_sensor:
   keepalive_interval_s: 15.0
 
 output:
-  root: DataCollection/Data
+  # Relative paths are relative to dataAcquisition/.
+  root: DataCollection/Data       # processed sessions (video.h5 etc.), read by Model/dataset.py
+  raw_root: DataCollection/Raw    # raw recordings (color.mkv, depth.mkv, ...); may point to an external disk, e.g. /mnt/e/Raw
+  color_encoder: libx264          # "libx264" (CPU, 4:2:2) or "h264_nvenc" (GPU, 4:2:0)
+  color_crf: 12                   # x264 CRF / nvenc QP: lower = better; 0 = lossless (much larger)
+  writer_queue_frames: 90         # frames buffered per encoder before frames are dropped (~370 MB at 1080p)
+  process_on_stop: true           # launch offlineExtract.py automatically when a recording stops
+  delete_raw_after_processing: false  # remove Raw/session_x once Data/session_x is written successfully
+
+offline:
+  smoothing_window_frames: 9      # Savitzky-Golay window (odd) for the zero-phase trajectory smoothing
+  smoothing_polyorder: 2
+  max_gap_interp_frames: 3        # missing MediaPipe detections up to this many frames are interpolated
+  save_only_valid_frames: true    # keep Model/dataset.py's contract: frames.csv holds only tracked, depth-validated frames
+  align_check_tolerance_counts: 5 # max |numpy align - rs.align| (depth counts) counted as agreement
+  qc_strip_frames: 16             # consecutive crops shown in qc/crop_strip.png
 
 # Configuration for the offline post-processor (postProcessing/postProcessor.py).
 # Paths below are relative to the repo root (the directory this file lives in).

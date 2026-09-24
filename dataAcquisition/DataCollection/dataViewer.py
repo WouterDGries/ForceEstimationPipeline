@@ -28,7 +28,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QSlider, QVBoxLayout, QWidget,
+    QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 DEFAULT_DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
@@ -71,6 +71,43 @@ class SessionData:
 
     def num_frames(self):
         return len(self.frames)
+
+    def delete_frame(self, frame_index):
+        """Remove one color/depth crop and its metadata row from disk."""
+        if not 0 <= frame_index < self.num_frames():
+            raise IndexError(f"frame index out of range: {frame_index}")
+
+        video_path = os.path.join(self.session_dir, "video.h5")
+        frames_path = os.path.join(self.session_dir, "frames.csv")
+        video_tmp = video_path + ".tmp"
+        frames_tmp = frames_path + ".tmp"
+        try:
+            self.h5.close()
+            with h5py.File(video_path, "r") as source, h5py.File(video_tmp, "w") as target:
+                for name in ("color", "depth"):
+                    data = source[name]
+                    keep = np.concatenate((np.arange(frame_index), np.arange(frame_index + 1, len(data))))
+                    target.create_dataset(name, data=data[keep], compression="gzip")
+
+            self.frames.drop(self.frames.index[frame_index]).reset_index(drop=True).to_csv(
+                frames_tmp, index=False
+            )
+            os.replace(video_tmp, video_path)
+            os.replace(frames_tmp, frames_path)
+
+            self.frames = pd.read_csv(frames_path)
+            self.h5 = h5py.File(video_path, "r")
+            self.color = self.h5["color"]
+            self.depth = self.h5["depth"]
+            self.frame_time_s = (self.frames["host_ts_ns"].to_numpy() - self.t0) / 1e9
+        except Exception:
+            for temporary_path in (video_tmp, frames_tmp):
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+            self.h5 = h5py.File(video_path, "r")
+            self.color = self.h5["color"]
+            self.depth = self.h5["depth"]
+            raise
 
     def nearest_force_index(self, frame_ts_ns):
         idx = np.searchsorted(self.force_ts_ns, frame_ts_ns)
@@ -176,7 +213,13 @@ class ViewerWindow(QMainWindow):
         self.slider.setMaximum(session.num_frames() - 1)
         self.slider.setValue(0)
         self.slider.valueChanged.connect(self._on_slider_changed)
-        root_layout.addWidget(self.slider)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(self.slider)
+        self.delete_button = QPushButton("Delete current frame")
+        self.delete_button.clicked.connect(self._delete_current_frame)
+        controls_layout.addWidget(self.delete_button)
+        root_layout.addLayout(controls_layout)
 
         self._show_frame(0)
         self.resize(900, 750)
@@ -189,6 +232,35 @@ class ViewerWindow(QMainWindow):
 
     def _on_slider_changed(self, frame_index):
         self._show_frame(frame_index)
+
+    def _delete_current_frame(self):
+        frame_index = self.slider.value()
+        answer = QMessageBox.question(
+            self,
+            "Delete frame",
+            f"Delete frame {frame_index + 1} from this dataset? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            self.session.delete_frame(frame_index)
+        except Exception as error:
+            QMessageBox.critical(self, "Delete failed", str(error))
+            return
+
+        if self.session.num_frames() == 0:
+            self.close()
+            return
+
+        new_index = min(frame_index, self.session.num_frames() - 1)
+        self.slider.blockSignals(True)
+        self.slider.setMaximum(self.session.num_frames() - 1)
+        self.slider.setValue(new_index)
+        self.slider.blockSignals(False)
+        self._show_frame(new_index)
 
     def _show_frame(self, frame_index):
         session = self.session

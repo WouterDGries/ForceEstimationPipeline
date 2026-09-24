@@ -1,5 +1,6 @@
 # Recorded RGB-D and force data
 /dataAcquisition/DataCollection/Data/*
+/dataAcquisition/DataCollection/Raw/*
 
 # Post-processed copies of the above (see postProcessing/postProcessor.py)
 /postProcessing/ProcessedData/*
