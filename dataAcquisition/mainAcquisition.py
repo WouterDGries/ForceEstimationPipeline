@@ -75,7 +75,7 @@ def main():
                 "valid_sample_count": 0,
                 "sample_points": [],
             }
-
+###
             box = cameraHandler.compute_crop_box(last_crop_center[0], last_crop_center[1],
                                                   frame_width, frame_height, config)  #Calculating crop area
             color_crop_bgr, color_crop_rgb, depth_crop = cameraHandler.crop_color_and_depth(

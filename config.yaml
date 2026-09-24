@@ -10,11 +10,11 @@ camera:
   # Color and depth may use different native profiles; frames are aligned to
   # the color image before processing.
   color:
-    width: 848
-    height: 480
+    width: 1280
+    height: 720
     framerate: 30
     auto_exposure: false          # if false, exposure/gain below are used
-    exposure: 156                 # microseconds, range 1-10000 (default 166)
+    exposure: 100                 # microseconds, range 1-10000 (default 166)
     gain: 64                      # range 0-128 (default 64)
     auto_white_balance: false
     white_balance: 3000           # Kelvin, range 2800-6500 in steps of 10 (default 4600)
@@ -33,7 +33,7 @@ camera:
 
 hand_tracking:
   model_path: ../hand_landmarker.task
-  tracked_hand_label: Left        # which hand to follow: "Left" or "Right"
+  tracked_hand_label: Left        # which hqand to follow: "Left" or "Right"
   fingertip_landmark_index: 8     # MediaPipe index-fingertip landmark
   crop_size: 112                  # pixels; both color and depth crops are crop_size x crop_size
   depth_validation_tolerance_m: 0.02  # maximum center-to-neighborhood depth difference
@@ -53,3 +53,102 @@ force_sensor:
 
 output:
   root: DataCollection/Data
+
+# Configuration for the offline post-processor (postProcessing/postProcessor.py).
+# Paths below are relative to the repo root (the directory this file lives in).
+post_processing:
+  input_root: dataAcquisition/DataCollection/Data
+  output_root: postProcessing/ProcessedData/Data
+  qc_subdir: QC
+  force_filter:
+    # Zero-phase Butterworth low-pass (scipy sosfiltfilt). 10-15 Hz keeps the
+    # dynamics of a human press while removing sensor noise/mechanical
+    # vibration; zero-phase means no delay is introduced, which matters
+    # because these labels get resampled onto the frame timestamps.
+    cutoff_hz: 12.0
+    order: 4
+  contact:
+    # Hysteresis on the filtered |Fz| so the contact flag doesn't chatter
+    # right at the threshold. Only Fz is measured by this rig (see
+    # dataAcquisition/forceHandler.py), so "magnitude" here is |Fz|.
+    on_threshold_n: 0.4
+    off_threshold_n: 0.25
+    min_anchor_duration_s: 1.0   # minimum no-contact span shown as a QC baseline anchor
+  depth_cleaning:
+    # Edge-preserving spatial filter + hole-filling, run on the full aligned
+    # crop before it reaches the network. No SDK decimation (loses
+    # resolution) or temporal filter (smears the moving finger, mixes in
+    # history from outside the frame).
+    median_ksize: 5               # odd; light median filter to knock down flying pixels
+    inpaint_radius_px: 3
+    inpaint_method: telea          # "telea" or "ns" (Navier-Stokes)
+    max_depth_m: 0.30              # matches preprocessing/depth.py's MAX_DEPTH_M
+    max_invalid_fraction_flag: 0.5 # frames with more originally-invalid area than this are flagged
+  qc:
+    dropped_frame_gap_multiple: 2.0   # a frame gap > this x the median interval counts as a drop event
+    alignment_check_frame_count: 6    # number of frames rendered for the color/depth alignment check
+
+# Configuration for the fingertip force estimator (Model/dataset.py, model.py,
+# train.py, mainModel.py). Session folders are read directly from
+# dataAcquisition/DataCollection/Data - this pipeline does not depend on
+# post_processing above. Paths are relative to the repo root (this file's directory).
+model_training:
+  data_root: dataAcquisition/DataCollection/Data
+  splits:
+    # Fixed by session, never by window - overlapping windows from one
+    # recording landing in two splits would make the test error meaningless.
+    train_sessions:
+      - session_20260921_141555
+      - session_20260921_144821
+      - session_20260921_150131
+      - session_20260921_152258
+      - session_20260921_153036
+    val_sessions:
+      - session_20260921_145807
+    test_sessions:
+      - session_20260921_151612
+  window:
+    length: 20            # frames per clip, temporal stride 1
+    train_stride: 3        # window-start stride when building the training index
+    eval_stride: 1          # window-start stride for val/test (dense, no overlap skipped)
+    max_span_s: 0.8          # rule 1: reject a window if first-to-last-frame elapsed time exceeds this
+    max_force_change_n: 5.0   # rule 2: reject a window if |Fz(last) - Fz(first)| exceeds this
+  force_filter:
+    # Zero-phase Butterworth low-pass on force.csv before labels are read off
+    # it - the raw ~1kHz signal is noisy enough that an unfiltered label would
+    # make the network partly fit sensor noise.
+    cutoff_hz: 12.0
+    order: 4
+  label:
+    force_norm_scale_n: 20.0   # normalized_label = Fz_filtered_N / this; predictions convert back by multiplying
+  depth:
+    clip_mm: 40.0                    # per-window relative-depth channel is clipped to +/- this, then divided by it
+    hole_fill_inpaint_radius_px: 3
+    hole_fill_median_ksize: 3         # light edge-preserving filter after hole-filling, per-frame only
+  augmentation:
+    horizontal_flip_prob: 0.5
+    temporal_offset_max_frames: 2      # window start shifted by up to +/- this many frames, label shifted to match
+    rotation_enabled: false             # off by default - try only if val/train loss gap shows overfitting
+    rotation_max_deg: 8.0
+    depth_noise_enabled: false           # off by default - see rotation_enabled
+    depth_noise_std_mm: 0.25
+  loader:
+    batch_size: 16
+    num_workers: 4
+  training:
+    loss:
+      huber_delta_n: 1.5   # HuberLoss delta, in newtons (converted to normalized units at runtime)
+    optimizer:
+      head_lr: 1.0e-3
+      layer4_lr: 1.0e-4
+      layer3_lr: 3.0e-5
+      stem_lr: 1.0e-4
+      weight_decay: 1.0e-3   # not applied to biases or normalization (BatchNorm) parameters
+    schedule:
+      warmup_epochs: 1.5      # linear warmup, then cosine decay to 0 - both stepped per optimizer step
+    effective_batch_size: 16   # gradient accumulation makes up the gap if loader.batch_size is smaller
+    max_epochs: 60
+    early_stopping_patience: 15   # epochs without a val MAE improvement before stopping
+    grad_clip_max_norm: 1.0
+    checkpoint_dir: Model/checkpoints
+    metrics_history_file: metrics_history.csv
