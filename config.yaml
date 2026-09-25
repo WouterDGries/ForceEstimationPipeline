@@ -1,7 +1,6 @@
 # Configuration for the RGB-D + force-torque data-collection recorder.
 # Loaded by mainAcquisition.py and passed into cameraHandler / forceHandler /
-# dataWriter functions - nothing else in dataAcquisition/ hardcodes settings.
-
+# dataWriter functions - nothing else in dataAcquisition/ hardcod
 camera:
   # Valid (width, height) options for the D435 color stream: 320x180,
   # 320x240, 424x240, 640x360, 640x480, 848x480, 960x540, 1280x720, 1920x1080.
@@ -127,15 +126,26 @@ model_training:
     # Fixed by session, never by window - overlapping windows from one
     # recording landing in two splits would make the test error meaningless.
     train_sessions:
-      - session_20260921_141555
-      - session_20260921_144821
-      - session_20260921_150131
-      - session_20260921_152258
-      - session_20260921_153036
+      - session_20260924_140635
+      - session_20260924_142230
+      - session_20260924_142929
+      - session_20260924_143501
+      - session_20260924_145719
+      - session_20260924_150401
+      - session_20260924_152908
+      - session_20260924_153324
+      - session_20260925_111917
+      - session_20260925_112200
+      - session_20260925_113447
+      - session_20260925_113921
     val_sessions:
-      - session_20260921_145807
+      - session_20260924_142601
+      - session_20260924_150859
+      - session_20260925_112549
     test_sessions:
-      - session_20260921_151612
+      - session_20260924_145118
+      - session_20260924_153632
+      - session_20260925_115002
   window:
     length: 20            # frames per clip, temporal stride 1
     train_stride: 3        # window-start stride when building the training index
@@ -177,7 +187,7 @@ model_training:
       warmup_epochs: 1.5      # linear warmup, then cosine decay to 0 - both stepped per optimizer step
     effective_batch_size: 16   # gradient accumulation makes up the gap if loader.batch_size is smaller
     max_epochs: 60
-    early_stopping_patience: 15   # epochs without a val MAE improvement before stopping
+    early_stopping_patience: 10  # epochs without a val MAE improvement before stopping
     grad_clip_max_norm: 1.0
     checkpoint_dir: Model/checkpoints
     metrics_history_file: metrics_history.csv
