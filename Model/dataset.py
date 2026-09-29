@@ -410,14 +410,19 @@ def build_dataloader(split, config=None, shuffle=None):
     """Input: split name, optional config dict, optional shuffle override
     (defaults to True for "train", False otherwise). Returns
     (dataset, DataLoader) built from config['model_training']['loader'].
+    The loader gets its own generator seeded from training.seed, so the
+    shuffle order and the per-worker numpy seeds (augmentation) don't
+    depend on how much of torch's global RNG was used before it.
     """
     config = config or load_config()
     dataset = build_dataset(split, config)
     loader_config = config["model_training"]["loader"]
     shuffle = (split == "train") if shuffle is None else shuffle
+    seed = config["model_training"]["training"].get("seed")
+    generator = torch.Generator().manual_seed(seed) if seed is not None else None
     loader = DataLoader(
         dataset, batch_size=loader_config["batch_size"], shuffle=shuffle,
-        num_workers=loader_config["num_workers"], pin_memory=True,
+        num_workers=loader_config["num_workers"], pin_memory=True, generator=generator,
     )
     return dataset, loader
 

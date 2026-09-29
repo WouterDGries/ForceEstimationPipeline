@@ -16,6 +16,7 @@ import copy
 import csv
 import math
 import os
+import random
 import time
 
 import numpy as np
@@ -27,6 +28,24 @@ import dataset
 import model as model_module
 
 METRICS_FIELDS = ["epoch", "train_loss", "val_loss", "val_mae_n", "val_rmse_n", "val_r2", "lr", "epoch_time_s"]
+
+
+def set_seed(seed, deterministic=False):
+    """Input: integer seed and whether to force deterministic GPU kernels.
+    Seeds python, numpy and torch (CPU + all CUDA devices) - covering the
+    head init, dropout, shuffle order and augmentation. Seeding alone still
+    leaves cuDNN's non-deterministic 3D-conv backward kernels, so runs are
+    close but not bit-identical; deterministic=True swaps those for
+    deterministic (slower) ones. Returns nothing.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _split_decay_no_decay(named_parameters):
@@ -209,6 +228,8 @@ def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
         "depth_sign_convention": "positive = farther from camera than the window reference, negative = closer",
         "force_norm_scale_n": model_config["label"]["force_norm_scale_n"],
         "prediction_clamp_sign": clamp_sign,
+        "seed": model_config["training"].get("seed"),
+        "deterministic": model_config["training"].get("deterministic", False),
     }
     torch.save({"model_state_dict": net.state_dict(), "epoch": epoch, "val_mae_n": val_mae_n,
                 "metadata": metadata}, path)
@@ -222,6 +243,10 @@ def train(config=None):
     config = config or dataset.load_config()
     model_config = config["model_training"]
     training_config = model_config["training"]
+
+    # Before anything that draws random numbers - build_model initializes the head.
+    set_seed(training_config["seed"], training_config.get("deterministic", False))
+    print(f"[train] Seed: {training_config['seed']}  deterministic={training_config.get('deterministic', False)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
@@ -377,9 +402,12 @@ def check_overfit_one_batch(config, device, num_iterations=300, batch_size=6):
     aug["rotation_enabled"] = False
     aug["depth_noise_enabled"] = False
     aug["temporal_offset_max_frames"] = 0
+    seed = config["model_training"]["training"]["seed"]
+    set_seed(seed)
 
     train_dataset = dataset.build_dataset("train", config)
-    loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                        generator=torch.Generator().manual_seed(seed))
     batch = next(iter(loader))
     clip = batch["clip"].to(device)
     label = batch["label_normalized"].to(device)
@@ -414,6 +442,7 @@ if __name__ == "__main__":
     print(f"[train] Device: {run_device}" +
           (f" ({torch.cuda.get_device_name(run_device)})" if run_device.type == "cuda" else ""))
     run_config = dataset.load_config()
+    set_seed(run_config["model_training"]["training"]["seed"])
 
     print("[train] Building train dataset for the checks below")
     check_train_dataset, check_train_loader = dataset.build_dataloader("train", run_config)
