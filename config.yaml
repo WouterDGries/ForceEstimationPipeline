@@ -164,6 +164,11 @@ model_training:
     clip_mm: 40.0                    # per-window relative-depth channel is clipped to +/- this, then divided by it
     hole_fill_inpaint_radius_px: 3
     hole_fill_median_ksize: 3         # light edge-preserving filter after hole-filling, per-frame only
+  position:
+    # Fingertip crop centre (frames.csv crop_cx/crop_cy) at the label frame,
+    # normalized to [-1, 1] by the color image size, fed to the head next to
+    # the clip features - tells the model where on the arm it is pressing.
+    noise_std: 0.02                   # Gaussian noise on the normalized position, training split only
   augmentation:
     horizontal_flip_prob: 0.5
     temporal_offset_max_frames: 2      # window start shifted by up to +/- this many frames, label shifted to match

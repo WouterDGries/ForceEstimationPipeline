@@ -131,6 +131,14 @@ class _SessionData:
         self.frame_ts_ns = frames_df["host_ts_ns"].to_numpy()
         self.frame_fz_n = _load_filtered_frame_force(session_dir, self.frame_ts_ns, model_config["force_filter"])
 
+        # Crop centre in the full color image, normalized to [-1, 1] per axis
+        # (x: left -> right = elbow -> wrist). Clipped because a few tracking
+        # glitches place the centre outside the image.
+        color_meta = meta["camera"]["color"]
+        position_x = frames_df["crop_cx"].to_numpy() / color_meta["width"] * 2.0 - 1.0
+        position_y = frames_df["crop_cy"].to_numpy() / color_meta["height"] * 2.0 - 1.0
+        self.position = np.clip(np.stack([position_x, position_y], axis=1), -1.0, 1.0).astype(np.float32)   # (N, 2)
+
         with h5py.File(os.path.join(session_dir, "video.h5"), "r") as h5f:
             self.color = h5f["color"][:]     # (N, 112, 112, 3) uint8, RGB
             depth_raw = h5f["depth"][:]      # (N, 112, 112) uint16, raw sensor counts
@@ -270,6 +278,7 @@ class ForceClipDataset(Dataset):
         self.clip_mm = model_config["depth"]["clip_mm"]
         self.force_norm_scale_n = model_config["label"]["force_norm_scale_n"]
         self.augmentation_config = model_config["augmentation"]
+        self.position_noise_std = model_config["position"]["noise_std"]
 
         session_names = model_config["splits"][f"{split}_sessions"]
         data_root = os.path.join(REPO_ROOT, model_config["data_root"])
@@ -387,9 +396,16 @@ class ForceClipDataset(Dataset):
         depth_chw = depth_channel[np.newaxis, ...]              # (1,T,H,W)
         clip = np.concatenate([color_chw, depth_chw], axis=0).astype(np.float32)   # (4,T,H,W)
 
+        # Not mirrored by the horizontal flip: the flip only mirrors the crop's
+        # appearance, the fingertip is still at the same place on the arm.
+        position = session.position[label_index].copy()
+        if self.split == "train" and self.position_noise_std > 0:
+            position += np.random.normal(0.0, self.position_noise_std, size=position.shape).astype(np.float32)
+
         label_n = float(session.frame_fz_n[label_index])
         return {
             "clip": torch.from_numpy(clip),
+            "position": torch.from_numpy(position),
             "label_normalized": torch.tensor(label_n / self.force_norm_scale_n, dtype=torch.float32),
             "label_n": torch.tensor(label_n, dtype=torch.float32),
             "session": session.name,

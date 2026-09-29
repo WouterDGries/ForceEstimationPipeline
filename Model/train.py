@@ -49,7 +49,8 @@ def _split_decay_no_decay(named_parameters):
 def build_optimizer(net, optimizer_config):
     """Input: the adapted model and config['model_training']['training']
     ['optimizer']. Builds AdamW with one (decay, no_decay) parameter-group
-    pair per trainable module - head/layer4/layer3/stem - at that module's
+    pair per trainable module - head/position encoder/layer4/layer3/stem -
+    at that module's
     learning rate; decay groups use weight_decay, no_decay groups use 0.
     layer1/layer2 are frozen in model.py and never appear here. Returns
     the optimizer.
@@ -57,6 +58,7 @@ def build_optimizer(net, optimizer_config):
     weight_decay = optimizer_config["weight_decay"]
     module_lrs = [
         (net.fc, optimizer_config["head_lr"]),
+        (net.position_encoder, optimizer_config["head_lr"]),
         (net.layer4, optimizer_config["layer4_lr"]),
         (net.layer3, optimizer_config["layer3_lr"]),
         (net.stem, optimizer_config["stem_lr"]),
@@ -159,9 +161,10 @@ def run_validation(net, loader, device, autocast_dtype, loss_fn, force_norm_scal
     with torch.inference_mode():
         for batch in loader:
             clip = batch["clip"].to(device, non_blocking=True)
+            position = batch["position"].to(device, non_blocking=True)
             label = batch["label_normalized"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-                prediction = net(clip).squeeze(1).float()
+                prediction = net(clip, position).squeeze(1).float()
             loss = loss_fn(prediction, label)
             losses.append(loss.item())
             preds_n.append(_clamp_predictions(prediction, clamp_sign).cpu().numpy() * force_norm_scale_n)
@@ -189,7 +192,7 @@ def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
     checkpoint correctly later (Section 6): window length, temporal
     stride, label-frame convention, force component, crop size, colour
     normalization constants, depth reference/clip definition, and the
-    label normalization scale. Returns nothing.
+    label normalization scale and position-input definition. Returns nothing.
     """
     model_config = config["model_training"]
     metadata = {
@@ -209,6 +212,8 @@ def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
         "depth_sign_convention": "positive = farther from camera than the window reference, negative = closer",
         "force_norm_scale_n": model_config["label"]["force_norm_scale_n"],
         "prediction_clamp_sign": clamp_sign,
+        "position_input": "frames.csv crop_cx/crop_cy at the label frame, divided by the color image "
+                          "width/height, mapped to [-1, 1] (x = 2*cx/width - 1) and clipped; not mirrored by flips",
     }
     torch.save({"model_state_dict": net.state_dict(), "epoch": epoch, "val_mae_n": val_mae_n,
                 "metadata": metadata}, path)
@@ -276,10 +281,11 @@ def train(config=None):
         optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(train_loader):
             clip = batch["clip"].to(device, non_blocking=True)
+            position = batch["position"].to(device, non_blocking=True)
             label = batch["label_normalized"].to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-                prediction = net(clip).squeeze(1).float()   # cast to float32 before the loss - see module docstring
+                prediction = net(clip, position).squeeze(1).float()   # cast to float32 before the loss - see module docstring
                 loss = loss_fn(prediction, label) / accumulation_steps
 
             scaler.scale(loss).backward()
@@ -344,12 +350,13 @@ def check_frozen_batchnorm(net, train_loader, device, optimizer, loss_fn, autoca
     model_module.set_frozen_layers_eval(net)
     batch = next(iter(train_loader))
     clip = batch["clip"].to(device)
+    position = batch["position"].to(device)
     label = batch["label_normalized"].to(device)
 
     scaler = torch.amp.GradScaler(device="cuda" if device.type == "cuda" else "cpu", enabled=use_grad_scaler)
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-        prediction = net(clip).squeeze(1).float()
+        prediction = net(clip, position).squeeze(1).float()
         loss = loss_fn(prediction, label)
     scaler.scale(loss).backward()
     if use_grad_scaler:
@@ -377,11 +384,13 @@ def check_overfit_one_batch(config, device, num_iterations=300, batch_size=6):
     aug["rotation_enabled"] = False
     aug["depth_noise_enabled"] = False
     aug["temporal_offset_max_frames"] = 0
+    config["model_training"]["position"]["noise_std"] = 0.0
 
     train_dataset = dataset.build_dataset("train", config)
     loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     batch = next(iter(loader))
     clip = batch["clip"].to(device)
+    position = batch["position"].to(device)
     label = batch["label_normalized"].to(device)
 
     net = model_module.build_model(train_dataset.mean_normalized_label()).to(device)
@@ -398,7 +407,7 @@ def check_overfit_one_batch(config, device, num_iterations=300, batch_size=6):
     for iteration in range(1, num_iterations + 1):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-            prediction = net(clip).squeeze(1).float()
+            prediction = net(clip, position).squeeze(1).float()
             loss = loss_fn(prediction, label)
         loss.backward()
         optimizer.step()
