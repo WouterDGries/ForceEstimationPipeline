@@ -193,3 +193,81 @@ model_training:
     deterministic: false         # true = bit-identical GPU runs (deterministic cuDNN/cuBLAS kernels), slower
     checkpoint_dir: Model/checkpoints
     metrics_history_file: metrics_history.csv
+
+# Configuration for the single-frame (2D CNN) force estimator (Model2D/), used
+# to test whether the 3D CNN in Model/ is needed. Self-contained: nothing here
+# reads model_training above. Every value except the backbone-specific ones
+# starts as a copy of model_training, so the two runs differ only in the
+# temporal dimension - keep splits/window/force_filter/label/depth in sync with
+# model_training when comparing, or the comparison is no longer like-for-like.
+model2d_training:
+  data_root: dataAcquisition/DataCollection/Data
+  splits:
+    train_sessions:
+      - session_20260924_140635
+      - session_20260924_142230
+      - session_20260924_142929
+      - session_20260924_143501
+      - session_20260924_145719
+      - session_20260924_150401
+      - session_20260924_152908
+      - session_20260924_153324
+      - session_20260925_111917
+      - session_20260925_112200
+      - session_20260925_113447
+      - session_20260925_113921
+    val_sessions:
+      - session_20260924_142601
+      - session_20260924_150859
+      - session_20260925_112549
+    test_sessions:
+      - session_20260924_145118
+      - session_20260924_153632
+      - session_20260925_115002
+  window:
+    # The 2D model only ever sees the window's label (centre) frame. The window
+    # is still built and filtered exactly as in model_training, so both models
+    # are trained and scored on the same label frames.
+    length: 20
+    train_stride: 3
+    eval_stride: 1
+    max_span_s: 0.8
+    max_force_change_n: 5.0
+  force_filter:
+    cutoff_hz: 12.0
+    order: 4
+  label:
+    force_norm_scale_n: 20.0
+  depth:
+    clip_mm: 40.0                    # relative to the frame's own median valid depth
+    hole_fill_inpaint_radius_px: 3
+    hole_fill_median_ksize: 3
+  augmentation:
+    horizontal_flip_prob: 0.5
+    temporal_offset_max_frames: 2      # picks a neighbouring label frame (and its label) instead
+    rotation_enabled: false
+    rotation_max_deg: 8.0
+    depth_noise_enabled: false
+    depth_noise_std_mm: 0.25
+  loader:
+    batch_size: 16
+    num_workers: 4
+  training:
+    loss:
+      huber_delta_n: 1.5
+    optimizer:
+      head_lr: 1.0e-3
+      layer4_lr: 1.0e-4
+      layer3_lr: 3.0e-5
+      stem_lr: 1.0e-4                # resnet18 conv1 + bn1
+      weight_decay: 1.0e-3
+    schedule:
+      warmup_epochs: 1.5
+    effective_batch_size: 16
+    max_epochs: 60
+    early_stopping_patience: 10
+    grad_clip_max_norm: 1.0
+    seed: 42
+    deterministic: false
+    checkpoint_dir: Model2D/checkpoints
+    metrics_history_file: metrics_history.csv
