@@ -517,17 +517,68 @@ def draw_force_histogram(bin_percentages, bin_width_n, is_recording):
     return canvas
 
 
+def draw_force_gauge(fz_n, full_scale_n=20.0):
+    """Input: latest calibrated Fz in N (pressing is negative) and the dial's
+    full-scale magnitude. Returns a BGR canvas with a speedometer-style dial
+    running from 0 N (left) to -full_scale_n N (right), green -> red, with a
+    needle at the current Fz (clamped to the dial) and a numeric readout.
+    """
+    canvas_width, canvas_height = 400, 260
+    center = (canvas_width // 2, 210)
+    radius = 160
+    canvas = np.full((canvas_height, canvas_width, 3), 255, dtype=np.uint8)
+    cv2.putText(canvas, "Force Fz", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
 
-def show_previews(main_frame, color_crop_bgr, depth_crop, force_histogram_canvas, config):
+    def point_at(fraction, r):
+        angle = np.pi * (1.0 - fraction)  # fraction 0 = left (0 N), 1 = right (-full_scale_n N)
+        return int(center[0] + r * np.cos(angle)), int(center[1] - r * np.sin(angle))
+
+    # Colored arc: green at 0 N fading through yellow to red at full scale
+    num_segments = 60
+    for segment in range(num_segments):
+        fraction = (segment + 0.5) / num_segments
+        color = (0, int(200 * min(1.0, 2 * (1 - fraction))), int(255 * min(1.0, 2 * fraction)))
+        cv2.ellipse(canvas, center, (radius, radius), 0, 180 + 180 * segment / num_segments,
+                    180 + 180 * (segment + 1) / num_segments, color, 14)
+
+    # Ticks every 2 N, labels every 4 N
+    tick_step_n = 2.0
+    for tick_index in range(int(full_scale_n / tick_step_n) + 1):
+        tick_n = tick_index * tick_step_n
+        fraction = tick_n / full_scale_n
+        cv2.line(canvas, point_at(fraction, radius - 10), point_at(fraction, radius - 24), (0, 0, 0), 2)
+        if tick_index % 2 == 0:
+            label = f"{-tick_n:.0f}" if tick_n else "0"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+            label_x, label_y = point_at(fraction, radius - 42)
+            cv2.putText(canvas, label, (label_x - label_size[0] // 2, label_y + label_size[1] // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+    # Needle
+    needle_fraction = float(np.clip(-fz_n / full_scale_n, 0.0, 1.0))
+    cv2.line(canvas, center, point_at(needle_fraction, radius - 58), (0, 0, 200), 4, cv2.LINE_AA)
+    cv2.circle(canvas, center, 9, (40, 40, 40), -1, cv2.LINE_AA)
+
+    readout = f"{fz_n:.2f} N"
+    readout_size = cv2.getTextSize(readout, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+    cv2.putText(canvas, readout, (center[0] - readout_size[0] // 2, canvas_height - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
+    return canvas
+
+
+
+def show_previews(main_frame, color_crop_bgr, depth_crop, force_histogram_canvas, force_gauge_canvas, config):
     """Input: main (downscaled) display frame, optional live color/depth
     crops (None if no fingertip), the force-distribution canvas from
-    draw_force_histogram(), full config dict (uses config['hand_tracking']).
-    Shows the main RealSense window, the force distribution chart, plus
-    whichever crop preview windows are enabled. Returns nothing.
+    draw_force_histogram(), the force dial from draw_force_gauge(), full
+    config dict (uses config['hand_tracking']). Shows the main RealSense
+    window, the force distribution chart, the force gauge, plus whichever
+    crop preview windows are enabled. Returns nothing.
     """
     hand_config = config["hand_tracking"]
     cv2.imshow("RealSense", main_frame)
     cv2.imshow("Force Distribution", force_histogram_canvas)
+    cv2.imshow("Force Gauge", force_gauge_canvas)
     if hand_config["show_tracked_crop"] and color_crop_bgr is not None:
         cv2.imshow("Fingertip Crop (color)", color_crop_bgr)
     if hand_config["show_depth_preview"] and depth_crop is not None:

@@ -184,8 +184,9 @@ def main():
                                         force_reader.seconds_since_last_packet(), offline_queue.status)
             histogram_canvas = cameraHandler.draw_force_histogram(
                 force_histogram.percentages(), forceHandler.ForceHistogram.BIN_WIDTH_N, raw_writer is not None)
+            gauge_canvas = cameraHandler.draw_force_gauge(latest_force_fz)  #Drawing live force dial (0 to -20 N)
             cameraHandler.show_previews(preview_bgr, color_crop_bgr, depth_crop,
-                                         histogram_canvas, config)  #Showing previews
+                                         histogram_canvas, gauge_canvas, config)  #Showing previews
 
             key = cv2.waitKey(1) & 0xFF  #Checking keyboard input
             if key in (ord('q'), 27):
