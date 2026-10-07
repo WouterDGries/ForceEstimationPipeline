@@ -206,6 +206,16 @@ class _SessionData:
         return dt_s > window_config["max_span_s"]
 
 
+def window_mean_force_in_range(session, start, window_config):
+    """Input: a _SessionData, a window start frame and
+    config['model_training']['window']. Returns True if the mean filtered
+    Fz over the window's frames lies inside mean_force_range_n (inclusive).
+    """
+    min_force_n, max_force_n = window_config["mean_force_range_n"]
+    mean_force_n = float(np.mean(session.frame_fz_n[start:start + window_config["length"]]))
+    return min_force_n <= mean_force_n <= max_force_n
+
+
 def _build_window_index(sessions, window_config, stride, offset, split_name):
     """Input: list of _SessionData for one split, config['model_training']
     ['window'], the window-start stride to use, the label frame offset
@@ -222,7 +232,10 @@ def _build_window_index(sessions, window_config, stride, offset, split_name):
          dataAcquisition/offlineExtract.py's save_only_valid_frames gate - so a
          tracking failure shows up as a timestamp gap, not a flag);
       2. |Fz(last) - Fz(first)| <= max_force_change_n, from the filtered
-         per-frame force.
+         per-frame force;
+      3. the mean filtered Fz over the window lies inside
+         mean_force_range_n - applied to every split, so val/test are
+         scored on the same force range the model is trained on.
 
     There is no trial-boundary or synchronization-event marker anywhere in
     this data (checked directly against all 7 sessions), so those two
@@ -236,8 +249,9 @@ def _build_window_index(sessions, window_config, stride, offset, split_name):
     window_length = window_config["length"]
     max_span_s = window_config["max_span_s"]
     max_force_change_n = window_config["max_force_change_n"]
+    min_force_n, max_force_n = window_config["mean_force_range_n"]
 
-    kept, discarded_span, discarded_force, num_candidates = [], 0, 0, 0
+    kept, discarded_span, discarded_force, discarded_mean, num_candidates = [], 0, 0, 0, 0
     for session_index, session in enumerate(sessions):
         last_start = session.num_frames - window_length
         for start in range(0, max(last_start + 1, 0), stride):
@@ -251,11 +265,15 @@ def _build_window_index(sessions, window_config, stride, offset, split_name):
             if force_change_n > max_force_change_n:
                 discarded_force += 1
                 continue
+            if not window_mean_force_in_range(session, start, window_config):
+                discarded_mean += 1
+                continue
             kept.append((session_index, start))
 
     print(f"  [dataset] {split_name}: {num_candidates} candidate windows, "
           f"{discarded_span} discarded (span > {max_span_s}s), "
           f"{discarded_force} discarded (|dFz| > {max_force_change_n}N), "
+          f"{discarded_mean} discarded (mean Fz outside [{min_force_n}, {max_force_n}]N), "
           f"{len(kept)} kept")
     return kept
 
@@ -318,6 +336,7 @@ class ForceClipDataset(Dataset):
         self.label_offset = label_frame_offset(self.window_length)
         self.max_span_s = window_config["max_span_s"]
         self.max_force_change_n = window_config["max_force_change_n"]
+        self.window_config = window_config
         self.clip_mm = model_config["depth"]["clip_mm"]
         self.force_norm_scale_n = model_config["label"]["force_norm_scale_n"]
         self.augmentation_config = model_config["augmentation"]
@@ -351,8 +370,8 @@ class ForceClipDataset(Dataset):
         """Input: session and the window's originally-indexed start frame.
         Temporal-offset augmentation (Section 5): tries shifts in a
         shuffled order, keeping the first that stays in bounds, inside one
-        gap-free run, and still passes both hard filters (a shift can push
-        a window across a boundary the unshifted one didn't cross). Falls
+        gap-free run, and still passes all three hard filters (a shift can
+        push a window across a boundary the unshifted one didn't cross). Falls
         back to the original start if none do. Returns the (possibly
         shifted) start frame.
         """
@@ -370,7 +389,8 @@ class ForceClipDataset(Dataset):
                 continue
             span_s = (session.frame_ts_ns[end] - session.frame_ts_ns[start]) / 1e9
             force_change_n = abs(session.frame_fz_n[end] - session.frame_fz_n[start])
-            if span_s <= self.max_span_s and force_change_n <= self.max_force_change_n:
+            if (span_s <= self.max_span_s and force_change_n <= self.max_force_change_n
+                    and window_mean_force_in_range(session, start, self.window_config)):
                 return start
         return original_start
 

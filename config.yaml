@@ -145,6 +145,7 @@ model_training:
     eval_stride: 1          # window-start stride for val/test (dense, no overlap skipped)
     max_span_s: 0.8          # rule 1: reject a window if first-to-last-frame elapsed time exceeds this
     max_force_change_n: 5.0   # rule 2: reject a window if |Fz(last) - Fz(first)| exceeds this
+    mean_force_range_n: [-17.0, -2.0]  # rule 3: reject a window if its mean filtered Fz (N) lies outside [min, max] - applies to train, val and test
   force_filter:
     # Zero-phase Butterworth low-pass on force.csv before labels are read off
     # it - the raw ~1kHz signal is noisy enough that an unfiltered label would
