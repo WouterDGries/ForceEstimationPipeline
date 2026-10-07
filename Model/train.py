@@ -14,6 +14,7 @@ overfit-one-batch, trivial baseline) without a full training run.
 
 import copy
 import csv
+import json
 import math
 import os
 import random
@@ -228,6 +229,7 @@ def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
         "depth_sign_convention": "positive = farther from camera than the window reference, negative = closer",
         "force_norm_scale_n": model_config["label"]["force_norm_scale_n"],
         "prediction_clamp_sign": clamp_sign,
+        "splits": model_config["splits"],
         "seed": model_config["training"].get("seed"),
         "deterministic": model_config["training"].get("deterministic", False),
     }
@@ -250,6 +252,20 @@ def train(config=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
+
+    # Resolve the session split once and pin it as explicit lists, so every
+    # dataset built below (and the saved checkpoint) uses exactly this split.
+    config = copy.deepcopy(config)
+    model_config = config["model_training"]
+    splits = dataset.resolve_splits(model_config)
+    model_config["splits"] = {f"{split}_sessions": names for split, names in splits.items()}
+    for split, names in splits.items():
+        print(f"[train] {split} sessions ({len(names)}): {names}")
+
+    checkpoint_dir = os.path.join(dataset.REPO_ROOT, training_config["checkpoint_dir"])
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    with open(os.path.join(checkpoint_dir, "splits.json"), "w") as f:
+        json.dump(splits, f, indent=2)
 
     print("[train] Building datasets")
     train_dataset, train_loader = dataset.build_dataloader("train", config)
@@ -279,8 +295,6 @@ def train(config=None):
     delta_normalized = training_config["loss"]["huber_delta_n"] / model_config["label"]["force_norm_scale_n"]
     loss_fn = nn.HuberLoss(delta=delta_normalized)
 
-    checkpoint_dir = os.path.join(dataset.REPO_ROOT, training_config["checkpoint_dir"])
-    os.makedirs(checkpoint_dir, exist_ok=True)
     metrics_path = os.path.join(checkpoint_dir, training_config["metrics_history_file"])
     _init_metrics_file(metrics_path)
 

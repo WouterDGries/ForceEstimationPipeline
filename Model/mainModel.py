@@ -38,7 +38,7 @@ def main():
 
     config = dataset.load_config()                                            #Loading config.yaml
     model_config = config["model_training"]                                   #Pulling out the model_training block
-    splits = model_config["splits"]                                           #Pulling out the split assignment
+    splits = dataset.resolve_splits(model_config)                             #Discovering sessions and dividing them by the configured fractions
     loader_config = model_config["loader"]                                    #Pulling out the loader settings
     training_config = model_config["training"]                                #Pulling out the training settings
     if args.seed is not None:                                                 #Seed given on the command line
@@ -48,9 +48,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")     #Picking the device
     device_label = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"  #Naming it for the log
     print(f"[main] Device: {device} ({device_label})")                        #Reporting the device in use
-    print(f"[main] Train sessions ({len(splits['train_sessions'])}): {splits['train_sessions']}")  #Reporting the train split
-    print(f"[main] Val session:  {splits['val_sessions']}")                   #Reporting the val split
-    print(f"[main] Test session: {splits['test_sessions']}")                  #Reporting the held-out test split
+    print(f"[main] Sessions: {sum(len(names) for names in splits.values())} total -> "
+          f"train {len(splits['train'])} / val {len(splits['val'])} / test {len(splits['test'])}")  #Reporting the split sizes (train.py prints the lists)
     print(f"[main] Batch size: {loader_config['batch_size']}  "
           f"Effective batch size: {training_config['effective_batch_size']}")  #Reporting batch settings
     print(f"[main] Seed: {training_config['seed']}  "

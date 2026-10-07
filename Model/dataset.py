@@ -40,6 +40,57 @@ def load_config(path=CONFIG_PATH):
         return yaml.safe_load(f)
 
 
+SPLIT_NAMES = ("train", "val", "test")
+
+
+def discover_sessions(model_config):
+    """Input: config['model_training']. Returns the sorted names of every
+    session_* folder in data_root that offlineExtract.py finished
+    (PROCESSED_OK marker present).
+    """
+    data_root = os.path.join(REPO_ROOT, model_config["data_root"])
+    return sorted(name for name in os.listdir(data_root)
+                  if name.startswith("session_")
+                  and os.path.isfile(os.path.join(data_root, name, "PROCESSED_OK")))
+
+
+def resolve_splits(model_config):
+    """Input: config['model_training']. Returns {"train": [...], "val":
+    [...], "test": [...]} session names. Explicit <split>_sessions lists in
+    config's splits block are used as-is if any is present; otherwise all
+    discovered sessions are shuffled with split_seed and divided by
+    train/val/test_fraction. Splitting is always per session, never per
+    window. Raises ValueError on bad fractions or too few sessions.
+    """
+    splits_config = model_config["splits"]
+    if any(f"{split}_sessions" in splits_config for split in SPLIT_NAMES):
+        return {split: list(splits_config.get(f"{split}_sessions") or []) for split in SPLIT_NAMES}
+
+    fractions = {split: float(splits_config[f"{split}_fraction"]) for split in SPLIT_NAMES}
+    if any(fraction < 0 for fraction in fractions.values()) or abs(sum(fractions.values()) - 1.0) > 1e-6:
+        raise ValueError(f"split fractions must be >= 0 and sum to 1, got {fractions}")
+
+    names = discover_sessions(model_config)
+    rng = np.random.default_rng(splits_config.get("split_seed", 0))
+    shuffled = [names[i] for i in rng.permutation(len(names))]
+
+    def count(split):
+        if fractions[split] == 0:
+            return 0
+        return max(1, int(round(fractions[split] * len(shuffled))))
+
+    num_val, num_test = count("val"), count("test")
+    num_train = len(shuffled) - num_val - num_test
+    if num_train < 1:
+        raise ValueError(f"only {len(shuffled)} session(s) found in {model_config['data_root']} - "
+                         f"not enough for a train/val/test split with fractions {fractions}")
+    return {
+        "train": sorted(shuffled[:num_train]),
+        "val": sorted(shuffled[num_train:num_train + num_val]),
+        "test": sorted(shuffled[num_train + num_val:]),
+    }
+
+
 def label_frame_offset(window_length):
     """Input: window length in frames. Returns the single, fixed local
     frame index (0-based, within the window) the force label is read from -
@@ -271,7 +322,7 @@ class ForceClipDataset(Dataset):
         self.force_norm_scale_n = model_config["label"]["force_norm_scale_n"]
         self.augmentation_config = model_config["augmentation"]
 
-        session_names = model_config["splits"][f"{split}_sessions"]
+        session_names = resolve_splits(model_config)[split]
         data_root = os.path.join(REPO_ROOT, model_config["data_root"])
         print(f"[dataset] Loading {split} split: {len(session_names)} session(s)")
         self.sessions = []
