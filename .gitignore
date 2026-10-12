@@ -8,7 +8,7 @@
 # Post-processed copies of the above (see postProcessing/postProcessor.py)
 /postProcessing/ProcessedData/*
 
-
+*.zip
 # Python cache and local tooling files
 __pycache__/
 *.py[cod]
