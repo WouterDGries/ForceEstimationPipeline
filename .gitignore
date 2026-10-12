@@ -2,6 +2,9 @@
 /dataAcquisition/DataCollection/Data/*
 /dataAcquisition/DataCollection/Raw/*
 
+# Training data written by preprocessing/dataProcessor.py
+/data/
+
 # Post-processed copies of the above (see postProcessing/postProcessor.py)
 /postProcessing/ProcessedData/*
 
@@ -16,3 +19,5 @@ __pycache__/
 .venv/
 venv/
 Model/checkpoints/
+Model2D/checkpoints/
+comparison/results/

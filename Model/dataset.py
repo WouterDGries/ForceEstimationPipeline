@@ -1,14 +1,13 @@
 """Dataset preparation for the fingertip force estimator.
 
-Reads the raw dataAcquisition session folders directly (frames.csv,
-force.csv, meta.json, video.h5 - see dataAcquisition/dataWriter.py for the
-on-disk layout this expects). For each session it low-pass filters
-force.csv's Fz and resamples it onto every frame timestamp, hole-fills the
-depth crops (they still contain real zero-value holes - checked directly,
-see the __main__ block below), then indexes valid 20-frame windows per
-config.yaml's model_training block. Produces normalized (4, T, 112, 112)
-RGB+relative-depth clips with a normalized centre-frame force label.
-Consumed by train.py via build_dataset().
+Reads the session folders preprocessing/dataProcessor.py writes (frames.csv
+with the per-frame label force_n = max(-Fz_filtered, 0) and artifact flag,
+crops.h5 with the color and hole-filled depth crops, meta.json - see that
+file's docstring). Every tracked frame is in there, also the ones without
+contact. This file only indexes valid 20-frame windows per config.yaml's
+model_training block (see window_reject_reason) and turns them into
+normalized (4, T, 112, 112) RGB+relative-depth clips with a normalized
+centre-frame force label. Consumed by train.py via build_dataset().
 """
 
 import json
@@ -20,16 +19,17 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-from scipy.signal import butter, sosfiltfilt
 from torch.utils.data import DataLoader, Dataset
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
 REPO_ROOT = os.path.dirname(os.path.abspath(CONFIG_PATH))
 
-# Kinetics-400 per-channel stats, RGB order. video.h5's "color" dataset is
-# already RGB - dataAcquisition/cameraHandler.py converts BGR->RGB before
-# writing it (see crop_color_and_depth) - so no channel-order conversion
-# happens here, only these stats.
+SPLIT_NAMES = ("train", "val", "test")
+PROCESSED_MARKER = "PROCESSED_OK"   # written by preprocessing/dataProcessor.py once a session is complete
+
+# Kinetics-400 per-channel stats, RGB order. crops.h5's "color" dataset is
+# already RGB (dataProcessor.py decodes the video as rgb24), so no
+# channel-order conversion happens here, only these stats.
 RGB_MEAN = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
 RGB_STD = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
 
@@ -38,6 +38,50 @@ def load_config(path=CONFIG_PATH):
     """Input: path to config.yaml. Returns it parsed as a dict."""
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def discover_sessions(model_config):
+    """Input: config['model_training']. Returns the sorted names of every
+    session_* folder in data_root that dataProcessor.py finished.
+    """
+    data_root = os.path.join(REPO_ROOT, model_config["data_root"])
+    return sorted(name for name in os.listdir(data_root)
+                  if name.startswith("session_") and os.path.isfile(os.path.join(data_root, name, PROCESSED_MARKER)))
+
+
+def resolve_splits(model_config):
+    """Input: config['model_training']. Returns {"train": [...], "val":
+    [...], "test": [...]} session names. Explicit <split>_sessions lists in
+    the splits block are used as-is if any is present; otherwise all
+    discovered sessions are shuffled with split_seed and divided by the
+    fractions (val/test get at least one session each if their fraction is
+    non-zero). Raises ValueError on bad fractions or too few sessions.
+    """
+    splits_config = model_config["splits"]
+    if any(f"{split}_sessions" in splits_config for split in SPLIT_NAMES):
+        return {split: list(splits_config.get(f"{split}_sessions") or []) for split in SPLIT_NAMES}
+
+    fractions = {split: float(splits_config[f"{split}_fraction"]) for split in SPLIT_NAMES}
+    if any(fraction < 0 for fraction in fractions.values()) or abs(sum(fractions.values()) - 1.0) > 1e-6:
+        raise ValueError(f"split fractions must be >= 0 and sum to 1, got {fractions}")
+
+    names = discover_sessions(model_config)
+    rng = np.random.default_rng(splits_config.get("split_seed", 0))
+    shuffled = [names[i] for i in rng.permutation(len(names))]
+
+    def count(split):
+        return 0 if fractions[split] == 0 else max(1, int(round(fractions[split] * len(shuffled))))
+
+    num_val, num_test = count("val"), count("test")
+    num_train = len(shuffled) - num_val - num_test
+    if num_train < 1:
+        raise ValueError(f"only {len(shuffled)} processed session(s) in {model_config['data_root']} - "
+                         f"not enough for a train/val/test split with fractions {fractions}")
+    return {
+        "train": sorted(shuffled[:num_train]),
+        "val": sorted(shuffled[num_train:num_train + num_val]),
+        "test": sorted(shuffled[num_train + num_val:]),
+    }
 
 
 def label_frame_offset(window_length):
@@ -50,72 +94,11 @@ def label_frame_offset(window_length):
     return window_length // 2
 
 
-def _estimate_sample_rate_hz(host_ts_ns):
-    """Input: sorted 1D array of monotonic host_ts_ns. Returns the
-    median-based sample rate in Hz, robust to the occasional dropped sample.
-    """
-    dt_ns = np.diff(host_ts_ns.astype(np.float64))
-    return 1e9 / np.median(dt_ns)
-
-
-def _zero_phase_lowpass(values, sample_rate_hz, cutoff_hz, order):
-    """Input: 1D force samples and their filter settings
-    (config['model_training']['force_filter']). Applies a zero-phase
-    Butterworth low-pass (sosfiltfilt - no delay is introduced) and returns
-    the filtered array, same shape as `values`.
-    """
-    sos = butter(order, cutoff_hz, btype="low", fs=sample_rate_hz, output="sos")
-    return sosfiltfilt(sos, values)
-
-
-def _load_filtered_frame_force(session_dir, frame_ts_ns, force_filter_config):
-    """Input: session directory, that session's frame host_ts_ns, and
-    config['model_training']['force_filter']. Reads force.csv, zero-phase
-    low-pass filters the full Fz trace, then resamples it onto every frame
-    timestamp (numpy.interp). Returns a (N,) float32 array of filtered Fz
-    in newtons, one value per frame - this is what both the window filters
-    and the label are read from, never the raw per-sample Fz.
-    """
-    force_df = pd.read_csv(os.path.join(session_dir, "force.csv"))
-    force_ts_ns = force_df["host_ts_ns"].to_numpy()
-    sample_rate_hz = _estimate_sample_rate_hz(force_ts_ns)
-    filtered_fz = _zero_phase_lowpass(force_df["fz_N"].to_numpy(), sample_rate_hz,
-                                       force_filter_config["cutoff_hz"], force_filter_config["order"])
-    return np.interp(frame_ts_ns, force_ts_ns, filtered_fz).astype(np.float32)
-
-
-def _hole_fill_depth_frame(depth_raw_u16, depth_scale_m, depth_config):
-    """Input: one raw (H, W) uint16 depth crop, the session's
-    depth_scale_m, and config['model_training']['depth']. Fills zero-valued
-    holes by inpainting from the nearest valid neighbours, then applies a
-    light median filter to knock down flying pixels along the finger
-    silhouette - both per-frame only, nothing here ever mixes in another
-    frame. Returns (depth_filled_mm, valid_mask): a float32 (H, W) array in
-    millimetres, and a bool mask True where the ORIGINAL reading was
-    non-zero (used for the per-window depth reference, not fed to the
-    network).
-    """
-    valid_mask = depth_raw_u16 > 0
-    depth_mm = depth_raw_u16.astype(np.float32) * depth_scale_m * 1000.0
-
-    if not np.any(valid_mask):
-        return depth_mm, valid_mask
-    if np.all(valid_mask):
-        hole_free_mm = depth_mm
-    else:
-        hole_mask = (~valid_mask).astype(np.uint8) * 255
-        source_mm = np.where(valid_mask, depth_mm, 0.0).astype(np.float32)
-        hole_free_mm = cv2.inpaint(source_mm, hole_mask, depth_config["hole_fill_inpaint_radius_px"], cv2.INPAINT_TELEA)
-
-    ksize = depth_config["hole_fill_median_ksize"]
-    filled_mm = cv2.medianBlur(hole_free_mm, ksize) if ksize > 1 else hole_free_mm
-    return filled_mm, valid_mask
-
-
 class _SessionData:
-    """Holds one session's fully-loaded, cleaned arrays in memory: color
-    frames, hole-filled depth (mm) + original-validity mask, per-frame
-    filtered force, and frame timestamps. video.h5 is opened once here and
+    """Holds one session's arrays in memory: color crops, hole-filled depth
+    (uint16 sensor counts - converted to mm per item, which keeps the whole
+    dataset at 5 bytes per pixel), the per-frame depth reference, force
+    label, artifact flag and timestamps. crops.h5 is opened once here and
     closed before __init__ returns - only plain numpy arrays are kept
     afterwards, so there's no open HDF5 handle to survive DataLoader worker
     forking (h5py file handles are not fork-safe; numpy arrays are).
@@ -126,24 +109,29 @@ class _SessionData:
         frames_df = pd.read_csv(os.path.join(session_dir, "frames.csv"))
         with open(os.path.join(session_dir, "meta.json")) as f:
             meta = json.load(f)
-        depth_scale_m = meta["camera"]["depth"]["depth_scale_m"]
+        self.depth_scale_mm = float(meta["camera"]["depth"]["depth_scale_m"]) * 1000.0
 
         self.frame_ts_ns = frames_df["host_ts_ns"].to_numpy()
-        self.frame_fz_n = _load_filtered_frame_force(session_dir, self.frame_ts_ns, model_config["force_filter"])
+        self.raw_frame_index = frames_df["raw_frame_index"].to_numpy()   # frame id shared with PressureVision's data
+        self.frame_force_n = frames_df["force_n"].to_numpy().astype(np.float32)
+        self.frame_artifact = frames_df["artifact"].to_numpy().astype(bool)
+        self.depth_ref_mm = frames_df["depth_ref_mm"].to_numpy().astype(np.float32)
+        self.original_invalid_fraction = float(frames_df["depth_invalid_fraction"].mean())
 
-        with h5py.File(os.path.join(session_dir, "video.h5"), "r") as h5f:
-            self.color = h5f["color"][:]     # (N, 112, 112, 3) uint8, RGB
-            depth_raw = h5f["depth"][:]      # (N, 112, 112) uint16, raw sensor counts
-
-        self.num_frames = depth_raw.shape[0]
-        self.depth_filled_mm = np.empty(depth_raw.shape, dtype=np.float32)
-        self.depth_valid = np.empty(depth_raw.shape, dtype=bool)
-        for i in range(self.num_frames):
-            self.depth_filled_mm[i], self.depth_valid[i] = _hole_fill_depth_frame(
-                depth_raw[i], depth_scale_m, model_config["depth"])
-        self.original_invalid_fraction = 1.0 - self.depth_valid.mean()
+        with h5py.File(os.path.join(session_dir, "crops.h5"), "r") as h5f:
+            self.color = h5f["color"][:]                # (N, 112, 112, 3) uint8, RGB
+            self.depth_filled = h5f["depth_filled"][:]  # (N, 112, 112) uint16, hole-filled sensor counts
+        self.num_frames = len(frames_df)
+        if self.color.shape[0] != self.num_frames:
+            raise ValueError(f"{self.name}: crops.h5 has {self.color.shape[0]} frames, frames.csv {self.num_frames}")
 
         self.gap_after = self._find_gap_after(model_config["window"])
+        # Cumulative artifact count, so "any artifact in [start, end]" is O(1) per window.
+        self.artifact_cumsum = np.concatenate([[0], np.cumsum(self.frame_artifact)])
+
+    def depth_mm(self, index):
+        """Returns the hole-filled depth of frame(s) `index` in millimetres, float32."""
+        return self.depth_filled[index].astype(np.float32) * self.depth_scale_mm
 
     def _find_gap_after(self, window_config):
         """Returns a (num_frames-1,) bool array: True at index i if the
@@ -155,56 +143,65 @@ class _SessionData:
         return dt_s > window_config["max_span_s"]
 
 
+def window_reject_reason(session, start, window_config, label_offset):
+    """Input: a _SessionData, window start frame, config['model_training']['window'] and
+    the label frame offset. Returns None if the window may be used,
+    otherwise the name of the first rule it breaks:
+
+      "span"     first-to-last-frame elapsed time > max_span_s, from real
+                 timestamps. frames.csv only holds tracked frames, so a
+                 tracking loss or dropped camera frames show up as a
+                 timestamp gap - this keeps every clip temporally contiguous.
+      "artifact" any frame of the window is a force artifact (forearm
+                 lift-off, or outside the force recording) - its label is
+                 not a press, and the clip shows a different motion.
+      "label"    the label exceeds max_label_force_n (PressureVision's
+                 max_force_n - no presses this hard were intended).
+      "change"   |force(last) - force(first)| > max_force_change_n; only if
+                 that is set (null = off). Off by default: it removes the
+                 fastest presses and releases, exactly where the temporal
+                 context should help, and PressureVision has no such rule.
+    """
+    end = start + window_config["length"] - 1
+    if (session.frame_ts_ns[end] - session.frame_ts_ns[start]) / 1e9 > window_config["max_span_s"]:
+        return "span"
+    if session.artifact_cumsum[end + 1] - session.artifact_cumsum[start] > 0:
+        return "artifact"
+    if session.frame_force_n[start + label_offset] > window_config["max_label_force_n"]:
+        return "label"
+    max_change = window_config.get("max_force_change_n")
+    if max_change is not None and abs(session.frame_force_n[end] - session.frame_force_n[start]) > max_change:
+        return "change"
+    return None
+
+
 def _build_window_index(sessions, window_config, stride, offset, split_name):
     """Input: list of _SessionData for one split, config['model_training']
     ['window'], the window-start stride to use, the label frame offset
     (from label_frame_offset()), and the split name (for the printed
     report). Slides a window of window_config['length'] frames across every
-    session at the given stride and keeps only windows passing both hard
-    filters:
-
-      1. elapsed time from the first to the last frame <= max_span_s,
-         computed from real timestamps - this also rejects any window that
-         spans a tracking-failure/dropped-frame gap, since a dropped frame
-         inflates the elapsed time for the same frame-index span (frames.csv
-         only ever contains frames where tracking succeeded - see
-         dataAcquisition/offlineExtract.py's save_only_valid_frames gate - so a
-         tracking failure shows up as a timestamp gap, not a flag);
-      2. |Fz(last) - Fz(first)| <= max_force_change_n, from the filtered
-         per-frame force.
-
-    There is no trial-boundary or synchronization-event marker anywhere in
-    this data (checked directly against all 7 sessions), so those two
-    exclusions from the spec are not implemented as separate rules - both
-    would only ever fire on a timestamp gap or an abrupt force change,
-    which the two rules above already catch.
-
-    Prints candidate/discarded/kept counts. Returns a list of
-    (session_index, start_frame) tuples.
+    session at the given stride and keeps only windows passing every rule in
+    window_reject_reason(). Prints candidate/discarded/kept counts. Returns
+    a list of (session_index, start_frame) tuples.
     """
     window_length = window_config["length"]
-    max_span_s = window_config["max_span_s"]
-    max_force_change_n = window_config["max_force_change_n"]
-
-    kept, discarded_span, discarded_force, num_candidates = [], 0, 0, 0
+    kept, num_candidates = [], 0
+    discarded = {"span": 0, "artifact": 0, "label": 0, "change": 0}
     for session_index, session in enumerate(sessions):
         last_start = session.num_frames - window_length
         for start in range(0, max(last_start + 1, 0), stride):
-            end = start + window_length - 1
             num_candidates += 1
-            span_s = (session.frame_ts_ns[end] - session.frame_ts_ns[start]) / 1e9
-            if span_s > max_span_s:
-                discarded_span += 1
-                continue
-            force_change_n = abs(session.frame_fz_n[end] - session.frame_fz_n[start])
-            if force_change_n > max_force_change_n:
-                discarded_force += 1
-                continue
-            kept.append((session_index, start))
+            reason = window_reject_reason(session, start, window_config, offset)
+            if reason is None:
+                kept.append((session_index, start))
+            else:
+                discarded[reason] += 1
 
-    print(f"  [dataset] {split_name}: {num_candidates} candidate windows, "
-          f"{discarded_span} discarded (span > {max_span_s}s), "
-          f"{discarded_force} discarded (|dFz| > {max_force_change_n}N), "
+    print(f"  [dataset] {split_name}: {num_candidates} candidate windows, discarded: "
+          f"{discarded['span']} span > {window_config['max_span_s']}s, "
+          f"{discarded['artifact']} artifact frames, "
+          f"{discarded['label']} label > {window_config['max_label_force_n']}N, "
+          f"{discarded['change']} |dF| > {window_config.get('max_force_change_n')}N - "
           f"{len(kept)} kept")
     return kept
 
@@ -263,15 +260,14 @@ class ForceClipDataset(Dataset):
     def __init__(self, model_config, split):
         window_config = model_config["window"]
         self.split = split
+        self.window_config = window_config
         self.window_length = window_config["length"]
         self.label_offset = label_frame_offset(self.window_length)
-        self.max_span_s = window_config["max_span_s"]
-        self.max_force_change_n = window_config["max_force_change_n"]
         self.clip_mm = model_config["depth"]["clip_mm"]
         self.force_norm_scale_n = model_config["label"]["force_norm_scale_n"]
         self.augmentation_config = model_config["augmentation"]
 
-        session_names = model_config["splits"][f"{split}_sessions"]
+        session_names = resolve_splits(model_config)[split]
         data_root = os.path.join(REPO_ROOT, model_config["data_root"])
         print(f"[dataset] Loading {split} split: {len(session_names)} session(s)")
         self.sessions = []
@@ -292,7 +288,7 @@ class ForceClipDataset(Dataset):
         dataset - used to initialize the regression head's output bias
         (see model.py) so training starts out predicting the average force.
         """
-        labels = [self.sessions[session_index].frame_fz_n[start + self.label_offset] / self.force_norm_scale_n
+        labels = [self.sessions[session_index].frame_force_n[start + self.label_offset] / self.force_norm_scale_n
                   for session_index, start in self.windows]
         return float(np.mean(labels))
 
@@ -317,9 +313,7 @@ class ForceClipDataset(Dataset):
                 continue
             if start < end and session.gap_after[start:end].any():
                 continue
-            span_s = (session.frame_ts_ns[end] - session.frame_ts_ns[start]) / 1e9
-            force_change_n = abs(session.frame_fz_n[end] - session.frame_fz_n[start])
-            if span_s <= self.max_span_s and force_change_n <= self.max_force_change_n:
+            if window_reject_reason(session, start, self.window_config, self.label_offset) is None:
                 return start
         return original_start
 
@@ -331,13 +325,10 @@ class ForceClipDataset(Dataset):
         signal (the finger descending, the skin indenting); this is fixed
         once per window, from the label frame only. Falls back to the
         median of the whole hole-filled label frame if every pixel there
-        was originally invalid (rare).
+        was originally invalid (rare). Precomputed per frame by
+        preprocessing/dataProcessor.py (depth_ref_mm in frames.csv).
         """
-        label_valid = session.depth_valid[label_index]
-        label_depth_mm = session.depth_filled_mm[label_index]
-        if np.any(label_valid):
-            return float(np.median(label_depth_mm[label_valid]))
-        return float(np.median(label_depth_mm))
+        return float(session.depth_ref_mm[label_index])   # precomputed by dataProcessor.py
 
     def _geometric_augment(self, color, depth_channel):
         """Input: (T,H,W,3) float32 color in [0,1] and (T,H,W) float32
@@ -364,7 +355,7 @@ class ForceClipDataset(Dataset):
         label_index = start + self.label_offset
 
         color = session.color[start:end].astype(np.float32) / 255.0   # (T,H,W,3) in [0,1], RGB
-        depth_mm = session.depth_filled_mm[start:end]                  # (T,H,W) millimetres
+        depth_mm = session.depth_mm(slice(start, end))                 # (T,H,W) millimetres
 
         reference_mm = self._reference_depth_mm(session, label_index)
         diff_mm = depth_mm - reference_mm
@@ -387,7 +378,7 @@ class ForceClipDataset(Dataset):
         depth_chw = depth_channel[np.newaxis, ...]              # (1,T,H,W)
         clip = np.concatenate([color_chw, depth_chw], axis=0).astype(np.float32)   # (4,T,H,W)
 
-        label_n = float(session.frame_fz_n[label_index])
+        label_n = float(session.frame_force_n[label_index])
         return {
             "clip": torch.from_numpy(clip),
             "label_normalized": torch.tensor(label_n / self.force_norm_scale_n, dtype=torch.float32),
@@ -430,6 +421,8 @@ def build_dataloader(split, config=None, shuffle=None):
 if __name__ == "__main__":
     print("[dataset] Building train/val/test datasets from config.yaml's model_training block")
     cfg = load_config()
+    for split_name, names in resolve_splits(cfg["model_training"]).items():
+        print(f"[dataset] {split_name} ({len(names)}): {names}")
     train_dataset, train_loader = build_dataloader("train", cfg)
     val_dataset, _ = build_dataloader("val", cfg)
     test_dataset, _ = build_dataloader("test", cfg)

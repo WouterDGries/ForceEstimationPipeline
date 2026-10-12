@@ -66,7 +66,8 @@ force_sensor:
 
 output:
   # Relative paths are relative to dataAcquisition/.
-  root: DataCollection/Data       # processed sessions (video.h5 etc.), read by Model/dataset.py
+  root: DataCollection/Data       # offlineExtract.py output (video.h5 etc.) for quick checks; training data comes from
+                                  # preprocessing/dataProcessor.py (processing block below), which reads raw_root
   raw_root: DataCollection/Raw    # raw recordings (color.mkv, depth.mkv, ...); may point to an external disk, e.g. /mnt/e/Raw
   color_encoder: libx264          # "libx264" (CPU, 4:2:2) or "h264_nvenc" (GPU, 4:2:0)
   color_crf: 12                   # x264 CRF / nvenc QP: lower = better; 0 = lossless (much larger)
@@ -78,7 +79,8 @@ offline:
   smoothing_window_frames: 9      # Savitzky-Golay window (odd) for the zero-phase trajectory smoothing
   smoothing_polyorder: 2
   max_gap_interp_frames: 3        # missing MediaPipe detections up to this many frames are interpolated
-  save_only_valid_frames: true    # keep Model/dataset.py's contract: frames.csv holds only tracked, depth-validated frames
+  save_only_valid_frames: true    # frames.csv holds only tracked, depth-validated frames (drops most no-contact frames -
+                                  # the training data in data/processed keeps them, see the processing block)
   align_check_tolerance_counts: 5 # max |numpy align - rs.align| (depth counts) counted as agreement
   qc_strip_frames: 16             # consecutive crops shown in qc/crop_strip.png
 
@@ -116,54 +118,88 @@ post_processing:
     dropped_frame_gap_multiple: 2.0   # a frame gap > this x the median interval counts as a drop event
     alignment_check_frame_count: 6    # number of frames rendered for the color/depth alignment check
 
+# Configuration for the training-data preprocessor (preprocessing/dataProcessor.py),
+# the RGB-D counterpart of ForceEstimationPressureVision's processing block:
+# same force label (force_n = max(-Fz, 0)), same artifact rule, and every
+# tracked frame is kept - also the ones without contact. Writes one folder per
+# session to output_root, read by Model/ and Model2D/ (data_root there).
+# Paths are relative to the repo root.
+processing:
+  raw_root: dataAcquisition/DataCollection/Raw   # session_* folders as written by mainAcquisition.py
+  output_root: data/processed
+
+  hand_tracking:
+    model_path: hand_landmarker.task
+    tracked_hand_label: null         # null = use meta_raw.json's hand_tracking.tracked_hand_label (the pressing hand)
+    fingertip_landmark_index: 8      # MediaPipe index fingertip
+    dip_landmark_index: 7            # MediaPipe index DIP joint (defines the finger axis)
+    max_gap_interp_frames: 5         # missing detections up to this many frames are interpolated (as in PressureVision)
+    smoothing_window_frames: 9       # Savitzky-Golay window (odd), zero-phase over every tracked run
+    smoothing_polyorder: 2
+    # 8-point fingertip depth check - only stored as frames.csv's
+    # fingertip_depth_valid flag, it no longer decides which frames are saved.
+    depth_validation_tolerance_m: 0.02
+    depth_validation_radius_m: 0.015
+    minimum_valid_depth_samples: 5
+
+  crop:
+    # Same geometry as the recorder's offline extractor (hand_tracking block
+    # above), so the crops match the ones the models were developed on.
+    side_mm: 40.0                    # physical side at the (smoothed, per-frame) fingertip depth
+    output_px: 112
+    anchor_alpha: 0.4                # crop center = TIP - anchor_alpha * (TIP - DIP)
+    rotate_to_finger_axis: false
+    max_outside_fraction: 0.25       # frames whose crop lies more than this far outside the image are dropped
+
+  force:
+    cutoff_hz: 12.0                  # zero-phase Butterworth low-pass before resampling onto frame timestamps
+    order: 4
+    frame_time_offset_ms: 0.0        # added to frame timestamps before looking up force (camera latency compensation)
+    # Fz reads NEGATIVE while pressing; label force_n = max(-Fz, 0).
+    # Fz above this is the forearm being lifted off the plate (end of every
+    # session, +20..+40 N), not a press - those frames are flagged as artifacts.
+    artifact_positive_n: 6.0
+    artifact_margin_s: 0.5           # also flag this much time around every artifact
+
+  depth_cleaning:
+    # Per-frame hole filling of the depth crop (was done in Model*/dataset.py).
+    inpaint_radius_px: 3
+    median_ksize: 3                  # light edge-preserving filter after hole-filling
+
+  align_check_tolerance_counts: 5
+  qc_strip_frames: 16
+
 # Configuration for the fingertip force estimator (Model/dataset.py, model.py,
-# train.py, mainModel.py). Session folders are read directly from
-# dataAcquisition/DataCollection/Data - this pipeline does not depend on
-# post_processing above. Paths are relative to the repo root (this file's directory).
+# train.py, mainModel.py). Reads the sessions preprocessing/dataProcessor.py
+# wrote (processing block above). Paths are relative to the repo root (this file's directory).
 model_training:
-  data_root: dataAcquisition/DataCollection/Data
+  data_root: data/processed
   splits:
-    # Fixed by session, never by window - overlapping windows from one
-    # recording landing in two splits would make the test error meaningless.
-    train_sessions:
-      - session_20260924_140635
-      - session_20260924_142230
-      - session_20260924_142929
-      - session_20260924_143501
-      - session_20260924_145719
-      - session_20260924_150401
-      - session_20260924_152908
-      - session_20260924_153324
-      - session_20260925_111917
-      - session_20260925_112200
-      - session_20260925_113447
-      - session_20260925_113921
-    val_sessions:
-      - session_20260924_142601
-      - session_20260924_150859
-      - session_20260925_112549
-    test_sessions:
-      - session_20260924_145118
-      - session_20260924_153632
-      - session_20260925_115002
+    # By session, never by window - overlapping windows from one recording
+    # landing in two splits would make the test error meaningless. Every
+    # PROCESSED_OK session in data_root is shuffled with split_seed and
+    # divided by these fractions; the resolved lists are saved as
+    # <checkpoint_dir>/splits.json and in best_model.pt.
+    train_fraction: 0.70
+    val_fraction: 0.15
+    test_fraction: 0.15
+    split_seed: 0
+    # Optional manual override (a missing key means an empty split):
+    # train_sessions: [session_20261002_112827, ...]
   window:
     length: 20            # frames per clip, temporal stride 1
     train_stride: 3        # window-start stride when building the training index
     eval_stride: 1          # window-start stride for val/test (dense, no overlap skipped)
-    max_span_s: 0.8          # rule 1: reject a window if first-to-last-frame elapsed time exceeds this
-    max_force_change_n: 5.0   # rule 2: reject a window if |Fz(last) - Fz(first)| exceeds this
-  force_filter:
-    # Zero-phase Butterworth low-pass on force.csv before labels are read off
-    # it - the raw ~1kHz signal is noisy enough that an unfiltered label would
-    # make the network partly fit sensor noise.
-    cutoff_hz: 12.0
-    order: 4
+    # Window rules. Always applied as well: no frame of the window may be a
+    # force artifact (forearm lift-off, see processing.force).
+    max_span_s: 0.8           # contiguity: reject a window if first-to-last-frame time exceeds this
+                              # (20 frames at 30 fps = 0.63 s, so this allows ~5 missing frames)
+    max_label_force_n: 30.0   # reject a window whose label exceeds this (PressureVision's max_force_n)
+    max_force_change_n: null  # optional: reject if |force(last) - force(first)| exceeds this; null = off
   label:
-    force_norm_scale_n: 20.0   # normalized_label = Fz_filtered_N / this; predictions convert back by multiplying
+    force_norm_scale_n: 20.0   # normalized_label = force_n / this; predictions convert back by multiplying
   depth:
     clip_mm: 40.0                    # per-window relative-depth channel is clipped to +/- this, then divided by it
-    hole_fill_inpaint_radius_px: 3
-    hole_fill_median_ksize: 3         # light edge-preserving filter after hole-filling, per-frame only
   augmentation:
     horizontal_flip_prob: 0.5
     temporal_offset_max_frames: 2      # window start shifted by up to +/- this many frames, label shifted to match
@@ -198,32 +234,23 @@ model_training:
 # to test whether the 3D CNN in Model/ is needed. Self-contained: nothing here
 # reads model_training above. Every value except the backbone-specific ones
 # starts as a copy of model_training, so the two runs differ only in the
-# temporal dimension - keep splits/window/force_filter/label/depth in sync with
-# model_training when comparing, or the comparison is no longer like-for-like.
+# temporal dimension - keep splits/window/label/depth in sync with
+# model_training when comparing, or the comparison is no longer like-for-like
+# (same fractions + split_seed over the same data_root = the same split).
 model2d_training:
-  data_root: dataAcquisition/DataCollection/Data
+  data_root: data/processed
   splits:
-    train_sessions:
-      - session_20260924_140635
-      - session_20260924_142230
-      - session_20260924_142929
-      - session_20260924_143501
-      - session_20260924_145719
-      - session_20260924_150401
-      - session_20260924_152908
-      - session_20260924_153324
-      - session_20260925_111917
-      - session_20260925_112200
-      - session_20260925_113447
-      - session_20260925_113921
-    val_sessions:
-      - session_20260924_142601
-      - session_20260924_150859
-      - session_20260925_112549
-    test_sessions:
-      - session_20260924_145118
-      - session_20260924_153632
-      - session_20260925_115002
+    # By session, never by window - overlapping windows from one recording
+    # landing in two splits would make the test error meaningless. Every
+    # PROCESSED_OK session in data_root is shuffled with split_seed and
+    # divided by these fractions; the resolved lists are saved as
+    # <checkpoint_dir>/splits.json and in best_model.pt.
+    train_fraction: 0.70
+    val_fraction: 0.15
+    test_fraction: 0.15
+    split_seed: 0
+    # Optional manual override (a missing key means an empty split):
+    # train_sessions: [session_20261002_112827, ...]
   window:
     # The 2D model only ever sees the window's label (centre) frame. The window
     # is still built and filtered exactly as in model_training, so both models
@@ -232,16 +259,12 @@ model2d_training:
     train_stride: 3
     eval_stride: 1
     max_span_s: 0.8
-    max_force_change_n: 5.0
-  force_filter:
-    cutoff_hz: 12.0
-    order: 4
+    max_label_force_n: 30.0
+    max_force_change_n: null
   label:
     force_norm_scale_n: 20.0
   depth:
     clip_mm: 40.0                    # relative to the frame's own median valid depth
-    hole_fill_inpaint_radius_px: 3
-    hole_fill_median_ksize: 3
   augmentation:
     horizontal_flip_prob: 0.5
     temporal_offset_max_frames: 2      # picks a neighbouring label frame (and its label) instead
@@ -271,3 +294,24 @@ model2d_training:
     deterministic: false
     checkpoint_dir: Model2D/checkpoints
     metrics_history_file: metrics_history.csv
+
+# Configuration for comparison/compareModels.py: scores the 3D, 2D and
+# PressureVision models on the test frames they all predicted. Every entry
+# under models is a list of globs of eval_test folders (written by each
+# project's evaluate.py / mainModel.py), one per trained run - all matching
+# runs of a model are averaged and their spread is reported. Paths are
+# relative to the repo root.
+comparison:
+  output_dir: comparison/results
+  data_root: data/processed            # labels, timestamps (force rate) and training frames (trivial baseline)
+  models:
+    3D: [Model/checkpoints/eval_test, Model/checkpoints/seed_*/eval_test]
+    2D: [Model2D/checkpoints/eval_test, Model2D/checkpoints/seed_*/eval_test]
+    PressureVision: [../ForceEstimationPressureVision/Model/checkpoints/eval_test,
+                     ../ForceEstimationPressureVision/Model/checkpoints/*_seed_*/eval_test]
+  contact_threshold_n: 0.5             # contact = force > this (PressureVision's contact_threshold_n)
+  max_label_force_n: 30.0              # for the trivial baseline's training frames
+  dynamic_force_rate_n_per_s: 10.0     # |dF/dt| above this = press onset / release ("dynamic" frames)
+  force_bins_n: [0.5, 2.0, 5.0, 10.0, 15.0, 30.0]
+  bootstrap_samples: 5000              # resamples of the test sessions
+  bootstrap_seed: 0

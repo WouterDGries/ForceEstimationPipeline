@@ -14,6 +14,7 @@ overfit-one-batch, trivial baseline) without a full training run.
 
 import copy
 import csv
+import json
 import math
 import os
 import random
@@ -120,13 +121,12 @@ def select_precision(device):
 def _prediction_clamp_sign(train_dataset):
     """Input: the training ForceClipDataset. Returns +1.0 or -1.0. Section
     8 asks to "clamp predictions to >= 0 at evaluation time", which assumes
-    a sensor convention where pressing reads positive; this rig's Fz reads
-    NEGATIVE while pressing (confirmed from the data - see the training
-    report), so the literal >=0 clamp would clamp every real prediction to
-    0 and make the evaluation meaningless. This infers the rig's actual
-    sign from the training set's mean label once, so the clamp keeps its
-    intent (a prediction can't cross past the zero/no-contact baseline)
-    on whichever side is physically correct here.
+    a sensor convention where pressing reads positive. The label is now
+    force_n = max(-Fz, 0) (preprocessing/dataProcessor.py), so this returns
+    +1.0; it is kept so checkpoints trained on the old signed-Fz labels
+    (-1.0) still evaluate correctly. Inferred from the training set's mean
+    label, so the clamp keeps its intent (a prediction can't cross past the
+    zero/no-contact baseline) on whichever side is physically correct.
     """
     return 1.0 if train_dataset.mean_normalized_label() >= 0 else -1.0
 
@@ -160,7 +160,7 @@ def _trivial_baseline_mae_n(train_dataset, eval_dataset):
     """
     mean_train_n = train_dataset.mean_normalized_label() * train_dataset.force_norm_scale_n
     eval_labels_n = np.array([
-        eval_dataset.sessions[session_index].frame_fz_n[start + eval_dataset.label_offset]
+        eval_dataset.sessions[session_index].frame_force_n[start + eval_dataset.label_offset]
         for session_index, start in eval_dataset.windows
     ])
     return float(np.mean(np.abs(eval_labels_n - mean_train_n)))
@@ -201,10 +201,10 @@ def _append_metrics_row(path, row):
         csv.DictWriter(f, fieldnames=METRICS_FIELDS).writerow(row)
 
 
-def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
+def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign, splits):
     """Input: destination path, the trained model, the full config dict,
-    the epoch number, this checkpoint's validation MAE, and the prediction
-    clamp sign. Saves the model weights plus everything needed to use the
+    the epoch number, this checkpoint's validation MAE, the prediction
+    clamp sign, and the resolved {"train"/"val"/"test": [sessions]} split. Saves the model weights plus everything needed to use the
     checkpoint correctly later (Section 6): window length, temporal
     stride, label-frame convention, force component, crop size, colour
     normalization constants, depth reference/clip definition, and the
@@ -215,11 +215,13 @@ def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
         "window_length": model_config["window"]["length"],
         "temporal_stride_within_window": 1,     # frames inside a window are always consecutive
         "label_frame_offset": dataset.label_frame_offset(model_config["window"]["length"]),
-        "force_component": "Fz",                 # the only component this rig measures - see dataAcquisition/forceHandler.py
-        "force_filter_cutoff_hz": model_config["force_filter"]["cutoff_hz"],
-        "force_filter_order": model_config["force_filter"]["order"],
-        "crop_size_px": 112,
-        "crop_physical_size_mm": None,   # not tracked by this rig - fixed pixel box, physical size is distance-dependent
+        "force_label": "force_n = max(-Fz_filtered, 0), newtons",   # Fz reads negative while pressing
+        "force_filter_cutoff_hz": config["processing"]["force"]["cutoff_hz"],
+        "force_filter_order": config["processing"]["force"]["order"],
+        "window_rules": dict(model_config["window"]),
+        "data_root": model_config["data_root"],
+        "crop_size_px": config["processing"]["crop"]["output_px"],
+        "crop_physical_size_mm": config["processing"]["crop"]["side_mm"],   # at the per-frame fingertip depth
         "rgb_mean": dataset.RGB_MEAN.tolist(),
         "rgb_std": dataset.RGB_STD.tolist(),
         "depth_reference_definition": "median of the originally-valid depth pixels (mm) at the window's "
@@ -232,7 +234,7 @@ def _save_checkpoint(path, net, config, epoch, val_mae_n, clamp_sign):
         "deterministic": model_config["training"].get("deterministic", False),
     }
     torch.save({"model_state_dict": net.state_dict(), "epoch": epoch, "val_mae_n": val_mae_n,
-                "metadata": metadata}, path)
+                "splits": splits, "metadata": metadata}, path)
 
 
 def train(config=None):
@@ -250,6 +252,12 @@ def train(config=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
+
+    # Pin the split as explicit lists so datasets and checkpoint agree.
+    splits = dataset.resolve_splits(model_config)
+    model_config["splits"] = {f"{split}_sessions": names for split, names in splits.items()}
+    for split, names in splits.items():
+        print(f"[train] {split} sessions ({len(names)}): {names}")
 
     print("[train] Building datasets")
     train_dataset, train_loader = dataset.build_dataloader("train", config)
@@ -281,6 +289,8 @@ def train(config=None):
 
     checkpoint_dir = os.path.join(dataset.REPO_ROOT, training_config["checkpoint_dir"])
     os.makedirs(checkpoint_dir, exist_ok=True)
+    with open(os.path.join(checkpoint_dir, "splits.json"), "w") as f:
+        json.dump(splits, f, indent=2)
     metrics_path = os.path.join(checkpoint_dir, training_config["metrics_history_file"])
     _init_metrics_file(metrics_path)
 
@@ -342,7 +352,7 @@ def train(config=None):
             best_val_mae_n = val_mae_n
             epochs_without_improvement = 0
             checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
-            _save_checkpoint(checkpoint_path, net, config, epoch, val_mae_n, clamp_sign)
+            _save_checkpoint(checkpoint_path, net, config, epoch, val_mae_n, clamp_sign, splits)
             print(f"  [train] validation MAE improved to {val_mae_n:.3f}N - checkpoint saved to {checkpoint_path}")
         else:
             epochs_without_improvement += 1
