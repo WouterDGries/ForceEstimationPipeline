@@ -19,18 +19,29 @@ to each checkpoint) and that the true labels agree, then reports per model
     with replacement) for every model's MAE and every pairwise MAE
     difference, plus the seed-to-seed spread
 
+With --benchmark it also measures every model's inference cost
+(benchmarkModel.py, one subprocess per model: parameters, FLOPs, latency,
+throughput, GPU memory, optionally CPU latency) and adds it to the report;
+--benchmark_only does just that (no predictions needed) and writes
+benchmark.md / benchmark.json.
+
 Settings and the run folders per model are in config.yaml's comparison
 block. Writes <output_dir>/summary.md, summary.json, common_predictions.csv,
 force_bin_mae.png and timeline_<session>.png.
 
 Usage (trajPipeline env, from the repo root, after evaluating every model):
     python comparison/compareModels.py
+    python comparison/compareModels.py --benchmark        # + inference time / compute per model
+    python comparison/compareModels.py --benchmark_only   # only the inference cost
 """
 
+import argparse
 import glob
 import json
 import os
+import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -280,7 +291,99 @@ def _summary_markdown(summary):
     return "\n".join(lines) + "\n"
 
 
+def _benchmark_checkpoint(name, model_settings, runs):
+    """Checkpoint to benchmark: the benchmark block's explicit `checkpoint`,
+    else best_model.pt next to the model's first evaluated run, else
+    <code_dir>/checkpoints/best_model.pt. Weights don't change the timing,
+    only which architecture/input size gets built.
+    """
+    candidates = [model_settings.get("checkpoint")]
+    if runs.get(name):
+        candidates.append(os.path.join(os.path.dirname(runs[name][0]), "best_model.pt"))
+    candidates.append(os.path.join(model_settings["code_dir"], "checkpoints", "best_model.pt"))
+    for candidate in candidates:
+        if candidate and os.path.isfile(repo_path(candidate)):
+            return repo_path(candidate)
+    return None
+
+
+def run_benchmarks(benchmark_settings, runs):
+    """Runs comparison/benchmarkModel.py once per model in
+    benchmark_settings['models'] (separate processes: the projects' modules
+    share names). Returns {model: result dict}; models without a checkpoint
+    or whose benchmark fails are reported and left out.
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarkModel.py")
+    options = {k: v for k, v in benchmark_settings.items() if k != "models"}
+    results = {}
+    for name, model_settings in benchmark_settings["models"].items():
+        checkpoint = _benchmark_checkpoint(name, model_settings, runs)
+        if checkpoint is None:
+            print(f"[compare] WARNING: no checkpoint found to benchmark {name} - left out")
+            continue
+        print(f"[compare] benchmarking {name} ({model_settings['kind']}) from {checkpoint}")
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "result.json")
+            completed = subprocess.run(
+                [sys.executable, script, "--kind", model_settings["kind"], "--code_dir", repo_path(model_settings["code_dir"]),
+                 "--checkpoint", checkpoint, "--settings", json.dumps(options), "--out", out_path],
+                cwd=repo_path(model_settings["code_dir"]))
+            if completed.returncode != 0 or not os.path.isfile(out_path):
+                print(f"[compare] WARNING: benchmark of {name} failed (exit code {completed.returncode}) - left out")
+                continue
+            with open(out_path) as f:
+                results[name] = json.load(f)
+    return results
+
+
+def _benchmark_markdown(results, settings):
+    if not results:
+        return "## Inference cost\n\nNo model could be benchmarked.\n"
+    models = list(results)
+    batch_size = settings["batch_size"]
+    first = results[models[0]]
+    lines = ["## Inference cost per force prediction", "",
+             f"Device: {first['device']}, precision: {first['precision']}, random inputs of each model's own size, "
+             f"{settings['timed_iterations']} timed passes after {settings['warmup_iterations']} warm-up. "
+             "Fingertip tracking and cropping are shared by all models and not included.", "",
+             "| | " + " | ".join(models) + " |", "|---" * (len(models) + 1) + "|"]
+
+    def row(label, key, fmt):
+        return f"| {label} | " + " | ".join(fmt.format(results[m][key]) if key in results[m] else "-"
+                                           for m in models) + " |"
+    lines += [
+        f"| input | " + " | ".join(results[m]["input"] for m in models) + " |",
+        row("frames per prediction", "frames_per_prediction", "{}"),
+        f"| parameters (M) | " + " | ".join(f"{results[m]['parameters'] / 1e6:.2f}" for m in models) + " |",
+        row("checkpoint size (MB)", "checkpoint_mb", "{:.1f}"),
+        row("GFLOPs per prediction", "gflops_per_prediction", "{:.2f}"),
+        row("GPU latency, batch 1, median (ms)", "latency_ms_median", "{:.2f}"),
+        row("GPU latency, batch 1, p95 (ms)", "latency_ms_p95", "{:.2f}"),
+        f"| max rate, batch 1 (predictions/s) | " + " | ".join(f"{1000.0 / results[m]['latency_ms_median']:.0f}"
+                                                              for m in models) + " |",
+        row(f"throughput, batch {batch_size} (predictions/s)", "throughput_predictions_per_s", "{:.0f}"),
+        row("peak GPU memory, batch 1 (MB)", "peak_gpu_memory_mb_batch1", "{:.0f}"),
+        row(f"peak GPU memory, batch {batch_size} (MB)", f"peak_gpu_memory_mb_batch{batch_size}", "{:.0f}"),
+    ]
+    if any("cpu_latency_ms_median" in results[m] for m in models):
+        lines += [row(f"CPU latency, batch 1, median (ms, {settings['cpu_threads']} threads)", "cpu_latency_ms_median", "{:.1f}"),
+                  row("CPU latency, batch 1, p95 (ms)", "cpu_latency_ms_p95", "{:.1f}")]
+    frame_budget_ms = 1000.0 / settings["camera_fps"]
+    lines += ["", f"Real time at {settings['camera_fps']} fps (one prediction per frame, budget {frame_budget_ms:.1f} ms): " +
+              ", ".join(f"{m} {'yes' if results[m]['latency_ms_median'] <= frame_budget_ms else 'no'}" for m in models) +
+              " (GPU, batch 1). The 3D model re-processes its whole window for every new frame.", "",
+              "GPU latency at batch 1 is largely fixed per-call overhead (Python, kernel launches), so for small models "
+              "it says little about compute - compare GFLOPs, batched throughput and CPU latency for that. "
+              "Run on the deployment machine for real-time numbers.", ""]
+    return "\n".join(lines) + "\n"
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--benchmark", action="store_true", help="also measure inference time / compute per model")
+    parser.add_argument("--benchmark_only", action="store_true", help="only measure inference time / compute")
+    args = parser.parse_args()
+
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     settings = config["comparison"]
@@ -289,6 +392,16 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     runs = find_runs(settings["models"])
+    if args.benchmark_only:
+        results = run_benchmarks(settings["benchmark"], runs)
+        with open(os.path.join(out_dir, "benchmark.json"), "w") as f:
+            json.dump(results, f, indent=2)
+        markdown = _benchmark_markdown(results, settings["benchmark"])
+        with open(os.path.join(out_dir, "benchmark.md"), "w") as f:
+            f.write(markdown)
+        print(markdown)
+        print(f"[compare] Outputs written to {out_dir}")
+        return
     if len(runs) < 2:
         sys.exit("[compare] need predictions from at least two models")
     splits = check_splits(runs)
@@ -352,11 +465,15 @@ def main():
                    for model, metrics_list in per_run_metrics.items()},
         "bootstrap": bootstrap(per_run_errors, masks, sessions, settings),
     }
+    if args.benchmark:
+        summary["inference_cost"] = run_benchmarks(settings["benchmark"], runs)
 
     common.to_csv(os.path.join(out_dir, "common_predictions.csv"), index=False)
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     markdown = _summary_markdown(summary)
+    if args.benchmark:
+        markdown += "\n" + _benchmark_markdown(summary["inference_cost"], settings["benchmark"])
     with open(os.path.join(out_dir, "summary.md"), "w") as f:
         f.write(markdown)
     _plots(common, list(runs), masks, settings, out_dir)

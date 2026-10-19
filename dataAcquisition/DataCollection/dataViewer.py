@@ -1,7 +1,8 @@
 """Manual review tool for a recorded session (see Data/session_*/README.md
 for the file layout). Plots the whole session's force trace with a slider
 underneath; scrubbing the slider jumps to the nearest recorded frame and
-shows its color crop and depth crop.
+shows its color crop and depth crop. Frames can be deleted individually or
+as an inclusive frame-number range.
 
 Run with the trajPipeline conda env (has PySide6/pyqtgraph/h5py):
 
@@ -24,11 +25,11 @@ import h5py
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QSlider, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 DEFAULT_DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
@@ -74,8 +75,14 @@ class SessionData:
 
     def delete_frame(self, frame_index):
         """Remove one color/depth crop and its metadata row from disk."""
-        if not 0 <= frame_index < self.num_frames():
-            raise IndexError(f"frame index out of range: {frame_index}")
+        self.delete_frames(frame_index, frame_index)
+
+    def delete_frames(self, first_frame_index, last_frame_index):
+        """Remove an inclusive range of color/depth crops and metadata rows."""
+        if not 0 <= first_frame_index <= last_frame_index < self.num_frames():
+            raise IndexError(
+                f"frame range out of range: {first_frame_index}-{last_frame_index}"
+            )
 
         video_path = os.path.join(self.session_dir, "video.h5")
         frames_path = os.path.join(self.session_dir, "frames.csv")
@@ -86,12 +93,15 @@ class SessionData:
             with h5py.File(video_path, "r") as source, h5py.File(video_tmp, "w") as target:
                 for name in ("color", "depth"):
                     data = source[name]
-                    keep = np.concatenate((np.arange(frame_index), np.arange(frame_index + 1, len(data))))
+                    keep = np.concatenate((
+                        np.arange(first_frame_index),
+                        np.arange(last_frame_index + 1, len(data)),
+                    ))
                     target.create_dataset(name, data=data[keep], compression="gzip")
 
-            self.frames.drop(self.frames.index[frame_index]).reset_index(drop=True).to_csv(
-                frames_tmp, index=False
-            )
+            self.frames.drop(
+                self.frames.index[first_frame_index:last_frame_index + 1]
+            ).reset_index(drop=True).to_csv(frames_tmp, index=False)
             os.replace(video_tmp, video_path)
             os.replace(frames_tmp, frames_path)
 
@@ -173,6 +183,21 @@ class ImagePanel(QWidget):
         self.image_label.setText(text)
 
 
+class FrameDeletionWorker(QThread):
+    def __init__(self, session, first_frame_index, last_frame_index, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.first_frame_index = first_frame_index
+        self.last_frame_index = last_frame_index
+        self.error = None
+
+    def run(self):
+        try:
+            self.session.delete_frames(self.first_frame_index, self.last_frame_index)
+        except Exception as error:
+            self.error = error
+
+
 class ViewerWindow(QMainWindow):
     def __init__(self, session):
         super().__init__()
@@ -221,6 +246,31 @@ class ViewerWindow(QMainWindow):
         controls_layout.addWidget(self.delete_button)
         root_layout.addLayout(controls_layout)
 
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("Delete frames from"))
+        self.first_frame_input = QSpinBox()
+        self.first_frame_input.setRange(1, session.num_frames())
+        range_layout.addWidget(self.first_frame_input)
+        range_layout.addWidget(QLabel("through (inclusive)"))
+        self.last_frame_input = QSpinBox()
+        self.last_frame_input.setRange(1, session.num_frames())
+        range_layout.addWidget(self.last_frame_input)
+        self.delete_range_button = QPushButton("Delete range")
+        self.delete_range_button.clicked.connect(self._delete_selected_frames)
+        range_layout.addWidget(self.delete_range_button)
+        root_layout.addLayout(range_layout)
+
+        deletion_status_layout = QHBoxLayout()
+        self.deletion_status_label = QLabel("Ready")
+        deletion_status_layout.addWidget(self.deletion_status_label)
+        self.deletion_progress = QProgressBar()
+        self.deletion_progress.setRange(0, 0)
+        self.deletion_progress.setMaximumWidth(120)
+        self.deletion_progress.hide()
+        deletion_status_layout.addWidget(self.deletion_progress)
+        root_layout.addLayout(deletion_status_layout)
+
+        self.deletion_worker = None
         self._show_frame(0)
         self.resize(900, 750)
 
@@ -235,32 +285,91 @@ class ViewerWindow(QMainWindow):
 
     def _delete_current_frame(self):
         frame_index = self.slider.value()
+        self._delete_frames(frame_index, frame_index)
+
+    def _delete_selected_frames(self):
+        first_frame_index = self.first_frame_input.value() - 1
+        last_frame_index = self.last_frame_input.value() - 1
+        self._delete_frames(first_frame_index, last_frame_index)
+
+    def _delete_frames(self, first_frame_index, last_frame_index):
+        first_frame_number = first_frame_index + 1
+        last_frame_number = last_frame_index + 1
+        if first_frame_number > last_frame_number:
+            QMessageBox.warning(
+                self,
+                "Invalid frame range",
+                "The first frame number must not be greater than the last.",
+            )
+            return
+
+        if first_frame_number == last_frame_number:
+            prompt = f"Delete frame {first_frame_number} from this dataset?"
+            title = "Delete frame"
+        else:
+            prompt = (
+                f"Delete frames {first_frame_number} through {last_frame_number} "
+                "from this dataset?"
+            )
+            title = "Delete frame range"
         answer = QMessageBox.question(
             self,
-            "Delete frame",
-            f"Delete frame {frame_index + 1} from this dataset? This cannot be undone.",
+            title,
+            prompt + " This cannot be undone.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
 
-        try:
-            self.session.delete_frame(frame_index)
-        except Exception as error:
-            QMessageBox.critical(self, "Delete failed", str(error))
+        self._set_deletion_in_progress(True)
+        self.deletion_worker = FrameDeletionWorker(
+            self.session, first_frame_index, last_frame_index, self
+        )
+        self.deletion_worker.finished.connect(
+            lambda: self._on_deletion_finished(first_frame_index)
+        )
+        self.deletion_worker.start()
+
+    def _set_deletion_in_progress(self, in_progress):
+        self.slider.setEnabled(not in_progress)
+        self.delete_button.setEnabled(not in_progress)
+        self.delete_range_button.setEnabled(not in_progress)
+        self.first_frame_input.setEnabled(not in_progress)
+        self.last_frame_input.setEnabled(not in_progress)
+        self.deletion_status_label.setText("Deleting frames..." if in_progress else "Ready")
+        self.deletion_progress.setVisible(in_progress)
+        self.plot_widget.setEnabled(not in_progress)
+
+    def _on_deletion_finished(self, first_frame_index):
+        worker = self.deletion_worker
+        self.deletion_worker = None
+        self._set_deletion_in_progress(False)
+        if worker.error is not None:
+            self.deletion_status_label.setText("Deletion failed")
+            QMessageBox.critical(self, "Delete failed", str(worker.error))
             return
 
+        self.deletion_status_label.setText("Deletion complete")
         if self.session.num_frames() == 0:
             self.close()
             return
 
-        new_index = min(frame_index, self.session.num_frames() - 1)
+        new_index = min(first_frame_index, self.session.num_frames() - 1)
         self.slider.blockSignals(True)
         self.slider.setMaximum(self.session.num_frames() - 1)
         self.slider.setValue(new_index)
         self.slider.blockSignals(False)
+        self.first_frame_input.setMaximum(self.session.num_frames())
+        self.last_frame_input.setMaximum(self.session.num_frames())
         self._show_frame(new_index)
+
+    def closeEvent(self, event):
+        if self.deletion_worker is not None and self.deletion_worker.isRunning():
+            event.ignore()
+            self.deletion_status_label.setText("Please wait for deletion to finish")
+            return
+        super().closeEvent(event)
 
     def _show_frame(self, frame_index):
         session = self.session
@@ -292,14 +401,43 @@ class ViewerWindow(QMainWindow):
         )
 
 
+REQUIRED_FILES = ["frames.csv", "force.csv", "meta.json", "video.h5"]
+
+
+def _has_required_files(directory):
+    return all(os.path.exists(os.path.join(directory, name)) for name in REQUIRED_FILES)
+
+
+def normalize_session_dir(chosen):
+    """Maps a picked folder onto the processed session directory: a folder
+    inside a session (e.g. its qc/ subfolder) resolves to the session itself,
+    and a Raw/session_* folder resolves to the matching Data/session_*.
+    Returns the original path unchanged if no better match exists.
+    """
+    path = os.path.abspath(chosen)
+    candidate = path
+    while not os.path.basename(candidate).startswith("session_"):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return path
+        candidate = parent
+
+    if _has_required_files(candidate):
+        return candidate
+    processed = os.path.join(DEFAULT_DATA_ROOT, os.path.basename(candidate))
+    if _has_required_files(processed):
+        return processed
+    return candidate
+
+
 def resolve_session_dir(argument):
     if argument:
-        return os.path.abspath(argument)
+        return normalize_session_dir(argument)
 
     app = QApplication.instance() or QApplication(sys.argv)
     start_dir = DEFAULT_DATA_ROOT if os.path.isdir(DEFAULT_DATA_ROOT) else os.getcwd()
     chosen = QFileDialog.getExistingDirectory(None, "Select a session directory", start_dir)
-    return chosen or None
+    return normalize_session_dir(chosen) if chosen else None
 
 
 def main():
@@ -314,8 +452,7 @@ def main():
     if not session_dir:
         return
 
-    required_files = ["frames.csv", "force.csv", "meta.json", "video.h5"]
-    missing = [name for name in required_files if not os.path.exists(os.path.join(session_dir, name))]
+    missing = [name for name in REQUIRED_FILES if not os.path.exists(os.path.join(session_dir, name))]
     if missing:
         QMessageBox.critical(None, "Invalid session directory",
                               f"{session_dir} is missing: {', '.join(missing)}")
