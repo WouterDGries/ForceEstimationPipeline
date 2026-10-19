@@ -61,10 +61,13 @@ def discover_sessions(model_config):
 def resolve_splits(model_config):
     """Input: config['model2d_training']. Returns {"train": [...], "val":
     [...], "test": [...]} session names. Explicit <split>_sessions lists in
-    the splits block are used as-is if any is present; otherwise all
-    discovered sessions are shuffled with split_seed and divided by the
-    fractions (val/test get at least one session each if their fraction is
-    non-zero). Raises ValueError on bad fractions or too few sessions.
+    the splits block are used as-is if any is present; otherwise the
+    discovered sessions are split stratified by recording day (the date in
+    session_YYYYMMDD_HHMMSS): val/test sizes come from the fractions (at
+    least one session each if non-zero), are divided over the days in
+    proportion to each day's session count (largest remainder), and the
+    sessions within each day are shuffled with split_seed. Raises
+    ValueError on bad fractions or too few sessions.
     """
     splits_config = model_config["splits"]
     if any(f"{split}_sessions" in splits_config for split in SPLIT_NAMES):
@@ -76,22 +79,40 @@ def resolve_splits(model_config):
 
     names = discover_sessions(model_config)
     rng = np.random.default_rng(splits_config.get("split_seed", 0))
-    shuffled = [names[i] for i in rng.permutation(len(names))]
 
     def count(split):
-        return 0 if fractions[split] == 0 else max(1, int(round(fractions[split] * len(shuffled))))
+        return 0 if fractions[split] == 0 else max(1, int(round(fractions[split] * len(names))))
 
     num_val, num_test = count("val"), count("test")
-    num_train = len(shuffled) - num_val - num_test
+    num_train = len(names) - num_val - num_test
     if num_train < 1:
-        raise ValueError(f"only {len(shuffled)} processed session(s) in {model_config['data_root']} - "
+        raise ValueError(f"only {len(names)} processed session(s) in {model_config['data_root']} - "
                          f"not enough for a train/val/test split with fractions {fractions}")
-    return {
-        "train": sorted(shuffled[:num_train]),
-        "val": sorted(shuffled[num_train:num_train + num_val]),
-        "test": sorted(shuffled[num_train + num_val:]),
-    }
 
+    # Group sessions by recording day, then give each day its proportional
+    # share of val and test (largest-remainder rounding).
+    by_day = {}
+    for name in names:
+        by_day.setdefault(name.split("_")[1], []).append(name)
+    days = sorted(by_day)
+
+    def per_day(total):
+        quotas = {day: total * len(by_day[day]) / len(names) for day in days}
+        counts = {day: int(quotas[day]) for day in days}
+        leftover = total - sum(counts.values())
+        for day in sorted(days, key=lambda d: quotas[d] - counts[d], reverse=True)[:leftover]:
+            counts[day] += 1
+        return counts
+
+    val_counts, test_counts = per_day(num_val), per_day(num_test)
+    splits = {split: [] for split in SPLIT_NAMES}
+    for day in days:
+        day_names = [by_day[day][i] for i in rng.permutation(len(by_day[day]))]
+        num_day_val, num_day_test = val_counts[day], test_counts[day]
+        splits["val"] += day_names[:num_day_val]
+        splits["test"] += day_names[num_day_val:num_day_val + num_day_test]
+        splits["train"] += day_names[num_day_val + num_day_test:]
+    return {split: sorted(splits[split]) for split in SPLIT_NAMES}
 
 def label_frame_offset(window_length):
     """Input: window length in frames. Returns the single, fixed local
