@@ -1,6 +1,6 @@
 """Measures the inference cost of ONE trained model - parameters, FLOPs,
 GPU/CPU latency, throughput and memory per force prediction. Called by
-compareModels.py --benchmark in a separate process per model, because the
+compareModels.ipynb (RUN_BENCHMARK = True) in a separate process per model, because the
 three projects all have top-level modules named dataset/model/train that
 would clash in one interpreter.
 
@@ -13,7 +13,7 @@ own unit of work, with random values (timing does not depend on content):
 Fingertip tracking and cropping (MediaPipe etc.) are the same for all three
 and are not included.
 
-Usage (normally via compareModels.py):
+Usage (normally via compareModels.ipynb):
     python comparison/benchmarkModel.py --kind clip3d --code_dir Model --checkpoint Model/checkpoints/best_model.pt \
         --settings '{"batch_size": 16, ...}' --out result.json
 """

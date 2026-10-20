@@ -1,0 +1,30 @@
+# Settings for comparison/validateModels.py: live validation of the 3D, 2D
+# and PressureVision force models on new recordings, with TrajectoryPipeline's
+# capture and processing (its pipeline/config.yaml sets camera, tracking,
+# crops, lift_stop_frames and the Potts filter). The force sensor comes from
+# config.yaml's force_sensor block (as in dataAcquisition), the frame and
+# metric settings from config.yaml's comparison block. Relative paths are
+# relative to the repo root.
+validation:
+  output_root: comparison/validation   # one folder per test: report.md, the plots, predictions.csv
+  ready_root: comparison/readyForProcessing   # recordings waiting for --process (lossless, ~2.6 MB per frame);
+                                              # each is deleted once processed without problems
+  temp_root: null                      # where each model's session data lives until its estimates are done
+                                       # (null = the system temp folder); deleted after every model
+  countdown_s: 5.0                     # after 'a', recording starts when this has run out (TrajectoryPipeline: 5 s)
+  trail_max_force_n: 20.0              # live trail colour scale: green = 0 N, red = this
+  trajectory_pipeline_root: ../TrajectoryPipeline
+
+  # One checkpoint per model (lowest test MAE of the three seeds in
+  # comparison/results/summary.json), run in this order, each with its own
+  # data and timer. kind: TrajectoryPipeline's force_estimation.model value.
+  models:
+    3D:
+      kind: 3d
+      checkpoint: Model/checkpoints/seed_2/best_model.pt
+    2D:
+      kind: 2d
+      checkpoint: Model2D/checkpoints/seed_3/best_model.pt
+    PressureVision:
+      kind: pressurevision
+      checkpoint: ../ForceEstimationPressureVision/Model/checkpoints/pressurevision_seed_3/best_model.pt

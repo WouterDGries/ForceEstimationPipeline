@@ -84,7 +84,7 @@ def main():
         print(f"[main] Test MAE: {test_metrics['overall']['mae_n']:.3f} N   "
               f"(trivial baseline {test_metrics['trivial_baseline_mean_train_force']['mae_n']:.3f} N) - "
               f"outputs in {checkpoint_dir}/eval_test/")                     #Reporting the headline test result
-    print("[main] Open explore.ipynb for training curves and plots; comparison/compareModels.py compares the models")  #Pointing to the next step
+    print("[main] Open explore.ipynb for training curves and plots; comparison/compareModels.ipynb compares the models")  #Pointing to the next step
     print("=" * 70)                                                          #Closing summary rule
 
 

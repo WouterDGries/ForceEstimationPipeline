@@ -1,7 +1,7 @@
 """Evaluates a trained checkpoint on a split - by default the held-out test
 sessions, densely (every window start, eval stride 1) - in the same output
 format as ForceEstimationPressureVision's Model/evaluate.py, so
-comparison/compareModels.py can match the predictions of all three models
+comparison/compareModels.ipynb can match the predictions of all three models
 frame by frame (session + raw_frame_index).
 
 The same file lives in Model/ (3D, clips) and Model2D/ (2D, single frames);

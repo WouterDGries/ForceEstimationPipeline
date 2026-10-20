@@ -369,7 +369,7 @@ input channels are not interchangeable.
 - Each model writes an `eval_test/predictions.csv` and metrics. The
   comparison script expects those predictions and checks that the
   session splits and ground-truth labels match before comparing:
-  `comparison/compareModels.py`.
+  `comparison/compareModels.ipynb`.
 - The common frame key is `(session, raw_frame_index)`. For a valid
   comparison, preserve shared session identities, force labels, and test
   sessions. Do not interpret equal numerical inputs or equal crop geometry:

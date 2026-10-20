@@ -21,3 +21,9 @@ venv/
 Model/checkpoints/
 Model2D/checkpoints/
 comparison/results/
+
+# Recordings waiting for comparison/validateModels.py --process
+/comparison/readyForProcessing/
+
+/comparison/validation/
+

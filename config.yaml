@@ -295,7 +295,7 @@ model2d_training:
     checkpoint_dir: Model2D/checkpoints
     metrics_history_file: metrics_history.csv
 
-# Configuration for comparison/compareModels.py: scores the 3D, 2D and
+# Configuration for comparison/compareModels.ipynb: scores the 3D, 2D and
 # PressureVision models on the test frames they all predicted. Every entry
 # under models is a list of globs of eval_test folders (written by each
 # project's evaluate.py / mainModel.py), one per trained run - all matching
@@ -316,8 +316,8 @@ comparison:
   bootstrap_samples: 5000              # resamples of the test sessions
   bootstrap_seed: 0
   benchmark:
-    # Inference cost per force prediction (compareModels.py --benchmark /
-    # --benchmark_only). Each model is built from its checkpoint (by default
+    # Inference cost per force prediction (compareModels.ipynb, RUN_BENCHMARK
+    # = True). Each model is built from its checkpoint (by default
     # best_model.pt next to its first evaluated run) and timed on random
     # inputs of its own size; code_dir is the folder with its model.py.
     models:
